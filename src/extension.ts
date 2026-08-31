@@ -7,10 +7,13 @@ import { ResultsPanel } from './resultsPanel';
 import { ConnectionFormPanel } from './connectionForm';
 import { connectionIcon, clearIcons } from './colorIcons';
 import { safeColor } from './theme';
+import { Catalog, loadCatalog } from './catalog';
+import { disposeLogs, log, showLogs, sqlPreview } from './log';
 
 let ctx: vscode.ExtensionContext;
 let store: ConnectionStore;
 let active: DbSession | undefined;
+let activeCatalog: Catalog | undefined;
 let statusItem: vscode.StatusBarItem;
 const treeChanged = new vscode.EventEmitter<void>();
 
@@ -34,10 +37,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dbtool.removeConnection', (item?: TreeArg) => removeConnection(item)),
     vscode.commands.registerCommand('dbtool.newQuery', () => newQuery()),
     vscode.commands.registerCommand('dbtool.runQuery', () => runQuery()),
-    vscode.commands.registerCommand('dbtool.clearAllData', () => clearAllData())
+    vscode.commands.registerCommand('dbtool.clearAllData', () => clearAllData()),
+    vscode.commands.registerCommand('dbtool.refreshSchema', () => refreshSchema()),
+    vscode.commands.registerCommand('dbtool.showLogs', () => showLogs()),
+    { dispose: disposeLogs }
   );
 
-  registerCompletions(context, () => active?.meta.kind);
+  registerCompletions(context, () => active?.meta.kind, () => activeCatalog);
   registerKeywordUppercase(context);
 }
 
@@ -134,6 +140,7 @@ async function connect(arg?: TreeArg): Promise<void> {
   if (!meta) return;
   const secret = (await store.secret(meta.id)) ?? '';
   try {
+    const t0 = performance.now();
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: `Connecting to ${meta.name}…` },
       async () => {
@@ -142,13 +149,52 @@ async function connect(arg?: TreeArg): Promise<void> {
         const next = await openSession(meta, secret);
         await active?.dispose().catch(() => undefined);
         active = next;
+        activeCatalog = undefined;
       }
     );
+    log(`Connected to ${meta.name} (${kindLabel(meta.kind)}) in ${(performance.now() - t0).toFixed(0)} ms`);
     refreshUi();
     vscode.window.setStatusBarMessage(`$(check) Connected to ${meta.name}`, 3000);
+    // Schema catalog loads in the background — completion upgrades when ready.
+    if (active) void refreshCatalog(active);
   } catch (e) {
+    log(`Connect failed for ${meta.name}: ${(e as Error)?.message ?? e}`);
     vscode.window.showErrorMessage(
       `DB Lite: failed to connect to "${meta.name}" — ${(e as Error)?.message ?? e}`
+    );
+  }
+}
+
+async function refreshCatalog(session: DbSession): Promise<void> {
+  if (!vscode.workspace.getConfiguration('dbtool').get('schemaCompletion', true)) return;
+  const t0 = performance.now();
+  try {
+    const cat = await loadCatalog(session);
+    if (active !== session) return; // switched away while loading
+    activeCatalog = cat;
+    log(
+      `Schema loaded for ${session.meta.name}: ${cat.tables.length} tables/views, ` +
+      `${cat.fks.length} foreign keys in ${(performance.now() - t0).toFixed(0)} ms`
+    );
+  } catch (e) {
+    log(`Schema load failed for ${session.meta.name}: ${(e as Error)?.message ?? e}`);
+  }
+}
+
+async function refreshSchema(): Promise<void> {
+  if (!active) {
+    vscode.window.showWarningMessage('DB Lite: connect to a database first.');
+    return;
+  }
+  const session = active;
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Window, title: `Refreshing schema of ${session.meta.name}…` },
+    () => refreshCatalog(session)
+  );
+  if (activeCatalog && active === session) {
+    vscode.window.setStatusBarMessage(
+      `$(check) Schema refreshed — ${activeCatalog.tables.length} tables/views`,
+      3000
     );
   }
 }
@@ -158,6 +204,8 @@ async function disconnect(): Promise<void> {
   const name = active.meta.name;
   await active.dispose().catch(() => undefined);
   active = undefined;
+  activeCatalog = undefined;
+  log(`Disconnected from ${name}`);
   refreshUi();
   vscode.window.setStatusBarMessage(`Disconnected from ${name}`, 3000);
 }
@@ -215,8 +263,13 @@ async function runQuery(): Promise<void> {
     vscode.window.showWarningMessage('DB Lite: open a SQL file to run a query.');
     return;
   }
-  const sel = editor.selection;
-  const sql = (sel.isEmpty ? editor.document.getText() : editor.document.getText(sel)).trim();
+  // Selection wins over the whole file; multiple selections run in order.
+  const selectedText = editor.selections
+    .filter((s) => !s.isEmpty)
+    .sort((a, b) => a.start.compareTo(b.start))
+    .map((s) => editor.document.getText(s))
+    .join('\n');
+  const sql = (selectedText || editor.document.getText()).trim();
   if (!sql) {
     vscode.window.showWarningMessage('DB Lite: nothing to run — the file/selection is empty.');
     return;
@@ -227,13 +280,20 @@ async function runQuery(): Promise<void> {
   }
   const session: DbSession = active;
   const maxRows = vscode.workspace.getConfiguration('dbtool').get<number>('maxRenderRows', 1000);
+  const scope = selectedText ? 'selection' : 'file';
   try {
     const outcome = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: `Running on ${session.meta.name}…` },
       () => session.run(sql)
     );
+    const rows = outcome.sets.reduce((a, s) => a + s.rowCount, 0);
+    log(
+      `Query on ${session.meta.name} (${scope}) ok in ${outcome.durationMs.toFixed(1)} ms — ` +
+      `${outcome.sets.length} set(s), ${rows} row(s): ${sqlPreview(sql)}`
+    );
     ResultsPanel.showResults(session.meta, outcome, maxRows);
   } catch (e) {
+    log(`Query on ${session.meta.name} (${scope}) FAILED: ${(e as Error)?.message ?? e} — ${sqlPreview(sql)}`);
     ResultsPanel.showError(session.meta, e);
   }
 }

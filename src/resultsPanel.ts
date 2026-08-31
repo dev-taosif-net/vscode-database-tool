@@ -1,12 +1,14 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { ConnectionMeta, QueryOutcome, ResultSet } from './types';
 import { paletteCss, safeColor } from './theme';
 import { connectionIcon } from './colorIcons';
 
 /**
- * Results are rendered into a single reused webview panel with scripts
- * disabled — plain HTML + CSS only, so rendering is fast and the panel
- * costs nothing when hidden (no retained context).
+ * Results are rendered into a single reused webview panel. The page is plain
+ * HTML + CSS plus one small inline script (nonce-locked CSP) that powers grid
+ * cell selection with a live aggregates footer (count / distinct / sum / avg /
+ * min / max) and copy-as-TSV. No retained context when hidden.
  */
 export class ResultsPanel {
   private static panel: vscode.WebviewPanel | undefined;
@@ -22,7 +24,7 @@ export class ResultsPanel {
         'dbtool.results',
         'Query Results',
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-        { enableScripts: false, retainContextWhenHidden: false }
+        { enableScripts: true, retainContextWhenHidden: false }
       );
       this.panel.onDidDispose(() => (this.panel = undefined));
     } else {
@@ -132,25 +134,162 @@ function esc(s: string): string {
 function page(body: string, meta: ConnectionMeta): string {
   const color = safeColor(meta.color);
   const accentBar = color ? `body{border-top:3px solid ${color};}` : '';
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  const nonce = crypto.randomBytes(16).toString('base64');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <style>
   ${paletteCss()}
   ${accentBar}
-  body { font-family: var(--vscode-font-family); font-size: 12px; padding: 6px 10px 20px; }
+  body { font-family: var(--vscode-font-family); font-size: 12px; padding: 6px 10px 34px; }
   .conn { display: inline-flex; align-items: center; gap: 6px; margin-right: 10px; }
   .envdot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
   .summary { margin: 4px 0 10px; }
   .tag { margin: 8px 0; padding: 4px 8px; display: inline-block; background: var(--badge-bg); color: var(--badge-fg); border-radius: 3px; }
-  .scroll { overflow: auto; max-height: 82vh; margin-bottom: 14px; border: 1px solid var(--border); }
+  .scroll { overflow: auto; max-height: 82vh; margin-bottom: 14px; border: 1px solid var(--border); user-select: none; }
   table { border-collapse: collapse; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; width: max-content; min-width: 100%; }
   th, td { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 3px 8px; text-align: left; max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  th { position: sticky; top: 0; background: var(--head-bg); font-weight: 600; z-index: 1; }
+  th { position: sticky; top: 0; background: var(--head-bg); font-weight: 600; z-index: 1; cursor: pointer; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  td.n, th.n { opacity: .45; text-align: right; user-select: none; }
+  td.n, th.n { opacity: .45; text-align: right; user-select: none; cursor: pointer; }
   tr:hover td { background: var(--hover); }
+  td.sel { background: var(--accent) !important; color: var(--accent-fg) !important; }
   .null { opacity: .5; font-style: italic; }
   .dim { opacity: .6; }
   .error { border-left: 3px solid var(--error); padding: 6px 10px; margin-top: 10px; }
   .error-title { color: var(--error); font-weight: 600; margin-bottom: 6px; }
   pre { white-space: pre-wrap; font-family: var(--vscode-editor-font-family, monospace); margin: 0 0 6px; }
-  </style></head><body>${body}</body></html>`;
+  #agg { position: fixed; bottom: 0; left: 0; right: 0; z-index: 2; padding: 5px 10px;
+         background: var(--head-bg); border-top: 1px solid var(--border);
+         font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #agg b { font-weight: 600; }
+  </style></head><body>${body}
+  <div id="agg" hidden></div>
+  <script nonce="${nonce}">${GRID_JS}</script>
+  </body></html>`;
 }
+
+/**
+ * Grid interaction: click/drag to select cells, click a header for the whole
+ * column, click a row number for the row, Ctrl/Cmd-click toggles, Shift-click
+ * extends, Escape clears, Ctrl/Cmd+C copies the selection as TSV. A footer
+ * shows aggregates over the selection (numeric stats parse the cell text, so
+ * DECIMAL values arriving as strings still count).
+ */
+const GRID_JS = String.raw`
+(function () {
+  var agg = document.getElementById('agg');
+  var sel = new Set();
+  var anchor = null;
+  var dragging = false;
+  var NUM = /^-?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
+  var fmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 6 }).format;
+
+  function clearSel() { sel.forEach(function (td) { td.classList.remove('sel'); }); sel.clear(); }
+  function add(td) { if (!sel.has(td)) { sel.add(td); td.classList.add('sel'); } }
+  function toggle(td) { if (sel.has(td)) { sel.delete(td); td.classList.remove('sel'); } else { add(td); } }
+  function isData(td) { return td && td.tagName === 'TD' && !td.classList.contains('n'); }
+  function pos(td) { return { table: td.closest('table'), r: td.parentElement.sectionRowIndex, c: td.cellIndex }; }
+
+  function selectRect(a, b) {
+    clearSel();
+    var rows = a.table.tBodies[0].rows;
+    var r1 = Math.min(a.r, b.r), r2 = Math.max(a.r, b.r);
+    var c1 = Math.max(1, Math.min(a.c, b.c)), c2 = Math.max(a.c, b.c);
+    for (var r = r1; r <= r2; r++) {
+      var cells = rows[r].cells;
+      for (var c = c1; c <= Math.min(c2, cells.length - 1); c++) add(cells[c]);
+    }
+  }
+
+  function update() {
+    if (sel.size < 2) { agg.hidden = true; return; }
+    var count = sel.size, nulls = 0, numCount = 0;
+    var sum = 0, min = Infinity, max = -Infinity;
+    var distinct = new Set();
+    sel.forEach(function (td) {
+      if (td.classList.contains('null')) { nulls++; distinct.add(' '); return; }
+      var t = td.textContent;
+      distinct.add(t);
+      if (NUM.test(t.trim())) {
+        var v = parseFloat(t);
+        numCount++; sum += v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+    });
+    var parts = ['<b>Count</b> ' + fmt(count), '<b>Distinct</b> ' + fmt(distinct.size)];
+    if (numCount) {
+      parts.push('<b>Sum</b> ' + fmt(sum), '<b>Avg</b> ' + fmt(sum / numCount),
+                 '<b>Min</b> ' + fmt(min), '<b>Max</b> ' + fmt(max));
+      if (numCount < count) parts.push('<span class="dim">' + fmt(numCount) + ' numeric</span>');
+    }
+    if (nulls) parts.push('<span class="dim">' + fmt(nulls) + ' NULL</span>');
+    agg.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+    agg.hidden = false;
+  }
+
+  document.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    var cell = e.target.closest('td, th');
+    if (!cell) { if (!e.target.closest('#agg')) { clearSel(); update(); } return; }
+    var table = cell.closest('table');
+    if (!table) return;
+    e.preventDefault();
+    if (cell.tagName === 'TH') {
+      if (cell.cellIndex === 0) return;
+      clearSel();
+      var rows = table.tBodies[0].rows;
+      for (var i = 0; i < rows.length; i++) add(rows[i].cells[cell.cellIndex]);
+      update(); return;
+    }
+    if (cell.classList.contains('n')) {
+      clearSel();
+      var tr = cell.parentElement;
+      for (var j = 1; j < tr.cells.length; j++) add(tr.cells[j]);
+      update(); return;
+    }
+    if (e.ctrlKey || e.metaKey) { toggle(cell); anchor = pos(cell); update(); return; }
+    if (e.shiftKey && anchor && anchor.table === table) { selectRect(anchor, pos(cell)); update(); return; }
+    dragging = true;
+    anchor = pos(cell);
+    clearSel(); add(cell); update();
+  });
+
+  document.addEventListener('mouseover', function (e) {
+    if (!dragging) return;
+    var td = e.target.closest('td');
+    if (!isData(td)) return;
+    var p = pos(td);
+    if (p.table !== anchor.table) return;
+    selectRect(anchor, p); update();
+  });
+
+  document.addEventListener('mouseup', function () { dragging = false; });
+
+  function selectionTsv() {
+    var byRow = new Map();
+    document.querySelectorAll('td.sel').forEach(function (td) {
+      var row = byRow.get(td.parentElement);
+      if (!row) { row = []; byRow.set(td.parentElement, row); }
+      row.push(td.classList.contains('null') ? '' : td.textContent);
+    });
+    var out = [];
+    byRow.forEach(function (cells) { out.push(cells.join('\t')); });
+    return out.join('\n');
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { clearSel(); update(); return; }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C') && sel.size) {
+      navigator.clipboard.writeText(selectionTsv());
+      e.preventDefault();
+    }
+  });
+
+  // Also cover the native copy path (e.g. Edit → Copy).
+  document.addEventListener('copy', function (e) {
+    if (!sel.size) return;
+    e.clipboardData.setData('text/plain', selectionTsv());
+    e.preventDefault();
+  });
+})();`;

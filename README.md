@@ -4,10 +4,10 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 
 ## Golden rule: super fast, super lightweight
 
-- The extension bundles to a **single ~36 KB minified file**. Activation does almost nothing.
+- The extension bundles to a **single ~65 KB minified file**. Activation does almost nothing.
 - Database drivers (`pg`, `mssql`) are **loaded lazily** — their code isn't even parsed until the moment you first connect.
-- Results render in a script-free webview (plain HTML/CSS), with row rendering capped (`dbtool.maxRenderRows`, default 1000) so huge result sets never freeze the UI.
-- Completion items are built once per dialect and cached — zero per-keystroke work.
+- Results render as plain HTML/CSS plus one tiny inline script (cell selection + aggregates), with row rendering capped (`dbtool.maxRenderRows`, default 1000) so huge result sets never freeze the UI.
+- Completion items are built once per dialect and cached; schema metadata loads once in the background after connect — per-keystroke work is a couple of regexes and map lookups.
 
 ## Features
 
@@ -17,10 +17,14 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 - **Per-connection timeout** — configurable connect timeout in seconds (default 10).
 - **Secure storage** — passwords and connection strings go into VS Code SecretStorage (your OS keychain: libsecret / macOS Keychain / Windows Credential Manager). Only non-secret metadata (host, port, names) is kept in extension state. Secrets are never sent into the form webview.
 - **SQL editing with IntelliSense** — ~250 curated built-in functions with signatures and one-line docs (aggregates, string, math, date/time, JSON, window functions, system) plus SQL keywords. Suggestions adapt to the dialect of the active connection.
+- **Context-aware completion** — after connecting, DB Lite loads the schema in the background: table names after `FROM` / `JOIN` / `INSERT INTO` / `UPDATE`, column names after `alias.` / `table.` / `schema.`, and columns of the tables referenced in the current statement (toggle: `dbtool.schemaCompletion`; refresh with `DB Lite: Refresh Schema`).
+- **JOIN auto-generation** — foreign keys drive JOIN suggestions: after `JOIN ` you get complete clauses like `customers c ON c.id = o.customer_id` for every FK-related table; after `JOIN x ` or `… ON ` the matching condition is suggested (toggle: `dbtool.smartJoins`).
 - **Auto-UPPERCASE keywords** — type `select ` and it becomes `SELECT ` (toggle: `dbtool.autoUppercaseKeywords`).
 - **Auto table aliases** — after `FROM order_details ` DB Lite suggests `od` (toggle: `dbtool.autoAlias`).
-- **Run queries** — `Ctrl+Enter` (or `Cmd+Enter`) runs the selection, or the whole file if nothing is selected. Multiple statements and multiple result sets are supported; T-SQL `GO` batch separators work.
+- **Run queries** — `Ctrl+Enter` (or `Cmd+Enter`) runs the selection (multi-cursor selections run in order), or the whole file if nothing is selected. Multiple statements and multiple result sets are supported; T-SQL `GO` batch separators work.
 - **Results panel** — row counts, execution time, sticky headers, NULL styling, error details.
+- **Grid aggregates** — click/drag cells in the results grid (headers select a column, row numbers a row; Ctrl/Cmd-click toggles, Shift-click extends) and a footer shows **Count · Distinct · Sum · Avg · Min · Max** over the selection. `Ctrl+C` copies selected cells as TSV; `Escape` clears.
+- **Debug logging** — `DB Lite: Show Logs` opens an output channel with connection, query, and schema-load timings and failures.
 - **Panel theme** — `dbtool.theme`: follow VS Code (`default`), or force `dark`/`light` for DB Lite panels.
 - **Connections view** — a DB Lite icon in the activity bar lists saved connections; click to connect, right-click to edit/remove.
 - **Clear all data** — `DB Lite: Clear All Data` command wipes every connection and stored credential (with confirmation).
@@ -33,6 +37,8 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 | `dbtool.theme` | `default` | Theme for DB Lite panels: follow VS Code, or force dark/light |
 | `dbtool.autoUppercaseKeywords` | `true` | UPPERCASE keywords as you type |
 | `dbtool.autoAlias` | `true` | Suggest table aliases after FROM/JOIN |
+| `dbtool.schemaCompletion` | `true` | Load schema metadata after connect for context-aware completion |
+| `dbtool.smartJoins` | `true` | Generate JOIN/ON clauses from foreign keys |
 | `dbtool.maxRenderRows` | `1000` | Rows rendered per result set |
 
 ## Getting started
@@ -55,22 +61,29 @@ The status bar shows the active connection; click it to switch.
 | `DB Lite: New SQL Query` | Open an untitled SQL editor (`Ctrl+Alt+N`) |
 | `DB Lite: Run Query` | Run selection / whole file (`Ctrl+Enter`) |
 | `DB Lite: Edit / Remove Connection` | Manage saved connections |
+| `DB Lite: Refresh Schema` | Re-load table/column/FK metadata for completions |
+| `DB Lite: Show Logs` | Open the DB Lite output channel (connection/query/schema timings) |
 | `DB Lite: Clear All Data` | Delete every connection + credential (confirmation required) |
 
 ## Building from source
 
 ```bash
 npm install
-npm run build          # bundle to dist/extension.js
+npm run build          # bundle to dist/extension.js (minified)
+npm run build:dev      # unminified + inline sourcemaps (for debugging)
+npm run watch          # rebuild on change
 npm run typecheck      # tsc --noEmit
 npx @vscode/vsce package --allow-missing-repository   # produce .vsix
 ```
 
-Install the generated `.vsix` via *Extensions → ⋯ → Install from VSIX*, or press `F5` in VS Code to launch an Extension Development Host.
+Install the generated `.vsix` via *Extensions → ⋯ → Install from VSIX*.
+
+### Debugging the extension
+
+Press `F5` (the **Run Extension** launch config) — it builds a dev bundle with sourcemaps and starts an Extension Development Host where breakpoints in `src/*.ts` work. At runtime, `DB Lite: Show Logs` shows what the extension is doing (connections, query timings, schema loads, failures).
 
 ## Roadmap ideas
 
-- Schema-aware completion (table/column names)
 - Query cancellation
 - Export results to CSV/JSON
 - More engines (MySQL, SQLite)

@@ -1,6 +1,8 @@
 import esbuild from 'esbuild';
 
 const watch = process.argv.includes('--watch');
+// --dev: unminified + inline sourcemaps, for F5 extension-host debugging.
+const dev = watch || process.argv.includes('--dev');
 
 // Golden rule: fast + lightweight.
 // - The extension itself bundles to one small minified file.
@@ -14,8 +16,8 @@ const options = {
   format: 'cjs',
   outfile: 'dist/extension.js',
   external: ['vscode', 'pg', 'pg-native', 'mssql'],
-  minify: !watch,
-  sourcemap: watch ? 'inline' : false,
+  minify: !dev,
+  sourcemap: dev ? 'inline' : false,
   logLevel: 'info',
 };
 

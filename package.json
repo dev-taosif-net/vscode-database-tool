@@ -2,7 +2,7 @@
   "name": "db-lite",
   "displayName": "DB Lite",
   "description": "Super fast, lightweight SQL client for PostgreSQL and Microsoft SQL Server. Write SQL with built-in function suggestions, execute, and view results instantly. Connections stored securely in the OS keychain.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "taosif",
   "license": "MIT",
   "author": "Taosif",
@@ -74,6 +74,18 @@
         "title": "Clear All Data (Connections & Credentials)",
         "category": "DB Lite",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "dbtool.refreshSchema",
+        "title": "Refresh Schema (completion metadata)",
+        "category": "DB Lite",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dbtool.showLogs",
+        "title": "Show Logs",
+        "category": "DB Lite",
+        "icon": "$(output)"
       }
     ],
     "viewsContainers": {
@@ -116,6 +128,16 @@
           "command": "dbtool.disconnect",
           "when": "view == dbtool.connections",
           "group": "1_actions@1"
+        },
+        {
+          "command": "dbtool.refreshSchema",
+          "when": "view == dbtool.connections",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "dbtool.showLogs",
+          "when": "view == dbtool.connections",
+          "group": "1_actions@3"
         },
         {
           "command": "dbtool.clearAllData",
@@ -199,6 +221,16 @@
           "default": true,
           "description": "Suggest a table alias after a table name in FROM/JOIN (order_details → od)."
         },
+        "dbtool.schemaCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load table/column/foreign-key metadata after connecting and use it for context-aware completions (tables after FROM/JOIN, columns after an alias + dot, …)."
+        },
+        "dbtool.smartJoins": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-generate JOIN clauses from foreign keys: after JOIN, suggest the full \"table alias ON alias.fk = other.pk\"; after ON, suggest the matching condition."
+        },
         "dbtool.maxRenderRows": {
           "type": "number",
           "default": 1000,
@@ -216,6 +248,7 @@
   "scripts": {
     "vscode:prepublish": "node esbuild.mjs",
     "build": "node esbuild.mjs",
+    "build:dev": "node esbuild.mjs --dev",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "package": "vsce package --allow-missing-repository"
