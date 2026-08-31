@@ -1,26 +1,25 @@
 import * as vscode from 'vscode';
 import { DbKind } from './types';
-import { Catalog, CatalogTable } from './catalog';
+import { Catalog, CatalogTable, CatalogRoutine, quoteName } from './catalog';
+import { parseTableRefs, SQL_KEYWORDS, QUALIFIED } from './sqlParse';
 import {
   COMMON_KEYWORDS, FnDoc, MSSQL_FUNCTIONS, MSSQL_KEYWORDS, PG_FUNCTIONS, PG_KEYWORDS,
-  UPPERCASE_TOKENS,
 } from './sqlData';
 
 /**
- * SQL completions, three layers:
+ * SQL completions, four layers:
  *  1. Static keywords + built-in functions (built once per dialect, cached).
- *  2. Schema-aware items from the connected DB's catalog: tables after
+ *  2. Statement-start snippets: typing `select` offers `SELECT * FROM `, etc.
+ *  3. Schema-aware items from the connected DB's catalog: tables after
  *     FROM/JOIN/INTO/UPDATE, columns after `alias.` / `table.` / `schema.`,
- *     and columns of the tables referenced in the current statement.
- *  3. JOIN auto-generation from foreign keys: after `JOIN ` a complete
+ *     procedures after EXEC/CALL, and columns of the tables referenced in the
+ *     current statement.
+ *  4. JOIN auto-generation from foreign keys: after `JOIN ` a complete
  *     `table alias ON alias.fk = other.pk` clause; after `JOIN t x ` or
  *     `... ON ` the matching FK condition.
- * All context detection is a couple of regexes over the current statement.
+ * Items are prebuilt right after the catalog loads (see prewarm), so the
+ * per-keystroke path is regexes + map lookups only — no allocation storms.
  */
-
-const KEYWORDS = new Set(UPPERCASE_TOKENS);
-const IDENT = String.raw`(?:\[[^\]]+\]|"[^"]+"|[A-Za-z_][\w$]*)`;
-const QUALIFIED = `${IDENT}(?:\\.${IDENT})*`;
 
 /** ... FROM | / JOIN | / INSERT INTO | / UPDATE |  → table names. */
 const TABLE_KEYWORD_TAIL = /\b(from|join|into|update)\s+$/i;
@@ -28,19 +27,29 @@ const TABLE_KEYWORD_TAIL = /\b(from|join|into|update)\s+$/i;
 const ON_TAIL = new RegExp(String.raw`\bjoin\s+(${QUALIFIED})(?:\s+(?:as\s+)?([A-Za-z_]\w*))?\s+on\s+$`, 'i');
 /** ... JOIN tbl [AS alias] |  → "ON a.col = b.col" suggestion. */
 const JOINED_TABLE_TAIL = new RegExp(String.raw`\bjoin\s+(${QUALIFIED})(?:\s+(?:as\s+)?([A-Za-z_]\w*))?\s+$`, 'i');
-/** Table references anywhere in the statement (with optional alias). */
-const REF_RE = new RegExp(String.raw`\b(?:from|join|update|into)\s+(${QUALIFIED})(?:\s+(?:as\s+)?([A-Za-z_]\w*))?`, 'gi');
 /** identifier chain directly before a typed `.` */
 const DOT_TAIL = new RegExp(`(${QUALIFIED})\\.$`);
+/** EXEC / EXECUTE / CALL followed by a (partial) routine name → procedures. */
+const EXEC_TAIL = /\b(exec(?:ute)?|call)\s+[\w$.[\]"]*$/i;
+/** Only the statement's first word typed so far → statement snippets apply. */
+const STMT_START = /^\s*[A-Za-z_]*$/;
+
+export interface CompletionApi {
+  /** Prebuild all catalog-derived items so the first keystroke has zero lag. */
+  prewarm(cat: Catalog): void;
+}
 
 export function registerCompletions(
   ctx: vscode.ExtensionContext,
   activeKind: () => DbKind | undefined,
   activeCatalog: () => Catalog | undefined
-): void {
+): CompletionApi {
   const staticCache = new Map<string, vscode.CompletionItem[]>();
+  const snippetCache = new Map<string, vscode.CompletionItem[]>();
   const tableItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
   const columnItemCache = new WeakMap<CatalogTable, vscode.CompletionItem[]>();
+  const routineItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
+  const execItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
 
   const columnItems = (cat: Catalog, t: CatalogTable): vscode.CompletionItem[] => {
     let items = columnItemCache.get(t);
@@ -51,7 +60,7 @@ export function registerCompletions(
           vscode.CompletionItemKind.Field
         );
         item.detail = c.dataType;
-        item.insertText = quoteIdent(c.name, cat.kind);
+        item.insertText = quoteName(c.name, cat.kind);
         item.sortText = '03' + String(i).padStart(3, '0');
         return item;
       });
@@ -70,6 +79,24 @@ export function registerCompletions(
     return items;
   };
 
+  const routineItems = (cat: Catalog): vscode.CompletionItem[] => {
+    let items = routineItemCache.get(cat);
+    if (!items) {
+      items = cat.routines.map((r) => routineItem(cat, r, false));
+      routineItemCache.set(cat, items);
+    }
+    return items;
+  };
+
+  const execItems = (cat: Catalog): vscode.CompletionItem[] => {
+    let items = execItemCache.get(cat);
+    if (!items) {
+      items = cat.routines.map((r) => routineItem(cat, r, true));
+      execItemCache.set(cat, items);
+    }
+    return items;
+  };
+
   const provider: vscode.CompletionItemProvider = {
     provideCompletionItems(document, position, _token, context) {
       const cat = activeCatalog();
@@ -80,6 +107,11 @@ export function registerCompletions(
       if (byTrigger && context.triggerCharacter === '.') {
         if (!cat) return [];
         return dotItems(stmt, cat, columnItems, tableItems);
+      }
+
+      // EXEC / CALL — stored procedures & functions, ready-to-fill templates.
+      if (cat && EXEC_TAIL.test(stmt.before)) {
+        return execItems(cat);
       }
 
       const refs = cat ? parseRefs(stmt.full, cat) : [];
@@ -102,26 +134,42 @@ export function registerCompletions(
         statics = buildStatic(kind);
         staticCache.set(key, statics);
       }
+      let snippets = snippetCache.get(key);
+      if (!snippets) {
+        snippets = buildSnippets(kind);
+        snippetCache.set(key, snippets);
+      }
 
-      const schemaItems: vscode.CompletionItem[] = [];
+      const items: vscode.CompletionItem[] = [];
+      if (STMT_START.test(stmt.before)) items.push(...snippets);
+      items.push(...ctxResult.items, ...aliasItems);
       if (cat) {
         const seen = new Set<CatalogTable>();
         for (const ref of refs) {
           if (ref.table && !seen.has(ref.table)) {
             seen.add(ref.table);
-            schemaItems.push(...columnItems(cat, ref.table));
+            items.push(...columnItems(cat, ref.table));
           }
         }
-        schemaItems.push(...tableItems(cat));
+        items.push(...tableItems(cat), ...routineItems(cat));
       }
-
-      return [...ctxResult.items, ...aliasItems, ...schemaItems, ...statics];
+      items.push(...statics);
+      return items;
     },
   };
 
   ctx.subscriptions.push(
     vscode.languages.registerCompletionItemProvider([{ language: 'sql' }], provider, ' ', '.')
   );
+
+  return {
+    prewarm(cat: Catalog): void {
+      tableItems(cat);
+      routineItems(cat);
+      execItems(cat);
+      for (const t of cat.tables) columnItems(cat, t);
+    },
+  };
 }
 
 // ------------------------------------------------------- statement awareness
@@ -154,13 +202,7 @@ interface TableRef {
 }
 
 function parseRefs(stmt: string, cat: Catalog): TableRef[] {
-  const out: TableRef[] = [];
-  for (const m of stmt.matchAll(REF_RE)) {
-    let alias: string | undefined = m[2];
-    if (alias && KEYWORDS.has(alias.toUpperCase())) alias = undefined;
-    out.push({ text: m[1], alias, table: cat.resolve(m[1]) });
-  }
-  return out;
+  return parseTableRefs(stmt).map((r) => ({ ...r, table: cat.resolve(r.text) }));
 }
 
 /** How a table's columns are prefixed in generated conditions. */
@@ -202,7 +244,7 @@ function contextItems(
   const joined = JOINED_TABLE_TAIL.exec(before);
   if (joined) {
     let alias: string | undefined = joined[2];
-    if (alias && KEYWORDS.has(alias.toUpperCase())) alias = undefined;
+    if (alias && SQL_KEYWORDS.has(alias.toUpperCase())) alias = undefined;
     return { exclusive: false, items: fkConditionItems(joined[1], alias, refs, cat, 'ON ') };
   }
 
@@ -232,7 +274,7 @@ function fkConditionItems(
     if (ref.table === joined && (ref.alias ?? '') === (alias ?? '')) continue;
     for (const j of cat.joins(joined, ref.table)) {
       const cond = j.aColumns
-        .map((c, i) => `${myPrefix}.${quoteIdent(c, cat.kind)} = ${refPrefix(ref)}.${quoteIdent(j.bColumns[i], cat.kind)}`)
+        .map((c, i) => `${myPrefix}.${quoteName(c, cat.kind)} = ${refPrefix(ref)}.${quoteName(j.bColumns[i], cat.kind)}`)
         .join(' AND ');
       const text = prefix + cond;
       if (seen.has(text)) continue;
@@ -262,7 +304,7 @@ function smartJoinItems(refs: TableRef[], cat: Catalog): vscode.CompletionItem[]
     for (const rel of cat.related(ref.table)) {
       const alias = pickAlias(rel.table.name, used);
       const cond = rel.otherColumns
-        .map((c, i) => `${alias}.${quoteIdent(c, cat.kind)} = ${refPrefix(ref)}.${quoteIdent(rel.myColumns[i], cat.kind)}`)
+        .map((c, i) => `${alias}.${quoteName(c, cat.kind)} = ${refPrefix(ref)}.${quoteName(rel.myColumns[i], cat.kind)}`)
         .join(' AND ');
       const text = `${qualify(rel.table, cat)} ${alias} ON ${cond}`;
       if (seen.has(text)) continue;
@@ -322,16 +364,47 @@ function tableItem(cat: Catalog, t: CatalogTable): vscode.CompletionItem {
   return item;
 }
 
-function qualify(t: CatalogTable, cat: Catalog): string {
-  const name = quoteIdent(t.name, cat.kind);
-  return t.schema.toLowerCase() === cat.defaultSchema
-    ? name
-    : `${quoteIdent(t.schema, cat.kind)}.${name}`;
+function routineItem(cat: Catalog, r: CatalogRoutine, forExec: boolean): vscode.CompletionItem {
+  const nonDefault = r.schema.toLowerCase() !== cat.defaultSchema;
+  const item = new vscode.CompletionItem(
+    { label: r.name, description: [nonDefault ? r.schema : '', r.kind].filter(Boolean).join(' · ') },
+    vscode.CompletionItemKind.Method
+  );
+  const q = qualify2(r.schema, r.name, cat);
+  const inputs = r.params.filter((p) => !p.output);
+  item.detail = r.signature
+    ? `${r.kind}(${r.signature})`
+    : `${r.kind}(${r.params.map((p) => `${p.name} ${p.dataType}${p.output ? ' OUTPUT' : ''}`).join(', ')})`;
+  if (forExec) {
+    // Ready-to-fill template: EXEC dbo.proc @a = ¦, @b = ¦  /  CALL fn(¦, ¦)
+    if (cat.kind === 'mssql') {
+      const args = r.params
+        .map((p, i) => {
+          const name = p.name.startsWith('@') ? p.name : '@' + p.name;
+          return `${name} = $${i + 1}${p.output ? ' OUTPUT' : ''}`;
+        })
+        .join(', ');
+      item.insertText = new vscode.SnippetString(args ? `${q} ${args}` : q);
+    } else {
+      const args = inputs.map((_, i) => `$${i + 1}`).join(', ');
+      item.insertText = new vscode.SnippetString(`${q}(${args})`);
+    }
+    item.sortText = '01' + r.name.toLowerCase();
+  } else {
+    item.insertText =
+      r.kind === 'function' ? new vscode.SnippetString(`${q}($0)`) : q;
+    item.sortText = '08' + r.name.toLowerCase();
+  }
+  return item;
 }
 
-function quoteIdent(name: string, kind: DbKind): string {
-  if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name)) return name;
-  return kind === 'mssql' ? `[${name}]` : `"${name}"`;
+function qualify(t: CatalogTable, cat: Catalog): string {
+  return qualify2(t.schema, t.name, cat);
+}
+
+function qualify2(schema: string, name: string, cat: Catalog): string {
+  const n = quoteName(name, cat.kind);
+  return schema.toLowerCase() === cat.defaultSchema ? n : `${quoteName(schema, cat.kind)}.${n}`;
 }
 
 // -------------------------------------------------------------------- aliases
@@ -388,6 +461,37 @@ function pickAlias(table: string, used: Set<string>): string {
   let i = 2;
   while (used.has(options[0] + i)) i++;
   return options[0] + i;
+}
+
+// ------------------------------------------------------- statement snippets
+
+/** [filter word, label, snippet body] */
+const SNIPPETS: readonly [string, string, string][] = [
+  ['select', 'SELECT * FROM', 'SELECT * FROM $0'],
+  ['select', 'SELECT COUNT(*) FROM', 'SELECT COUNT(*) FROM $0'],
+  ['insert', 'INSERT INTO … VALUES', 'INSERT INTO ${1:table} (${2:columns})\nVALUES ($0)'],
+  ['update', 'UPDATE … SET … WHERE', 'UPDATE ${1:table}\nSET ${2:column} = ${3:value}\nWHERE $0'],
+  ['delete', 'DELETE FROM … WHERE', 'DELETE FROM ${1:table}\nWHERE $0'],
+];
+
+function buildSnippets(kind: DbKind | undefined): vscode.CompletionItem[] {
+  const rows: [string, string, string][] = [...SNIPPETS];
+  rows.push(
+    kind === 'mssql'
+      ? ['select', 'SELECT TOP 100 * FROM', 'SELECT TOP 100 * FROM $0']
+      : ['select', 'SELECT * FROM … LIMIT', 'SELECT * FROM ${1:table} LIMIT ${2:100}$0']
+  );
+  return rows.map(([word, label, body], i) => {
+    const item = new vscode.CompletionItem(
+      { label, description: 'statement' },
+      vscode.CompletionItemKind.Snippet
+    );
+    item.filterText = word;
+    item.insertText = new vscode.SnippetString(body);
+    item.sortText = '000' + i;
+    item.preselect = i === 0;
+    return item;
+  });
 }
 
 // --------------------------------------------------------------- static items

@@ -4,10 +4,10 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 
 ## Golden rule: super fast, super lightweight
 
-- The extension bundles to a **single ~65 KB minified file**. Activation does almost nothing.
+- The extension bundles to a **single ~110 KB minified file**. Activation does almost nothing.
 - Database drivers (`pg`, `mssql`) are **loaded lazily** — their code isn't even parsed until the moment you first connect.
 - Results render as plain HTML/CSS plus one tiny inline script (cell selection + aggregates), with row rendering capped (`dbtool.maxRenderRows`, default 1000) so huge result sets never freeze the UI.
-- Completion items are built once per dialect and cached; schema metadata loads once in the background after connect — per-keystroke work is a couple of regexes and map lookups.
+- **Zero-lag completion**: the schema catalog is cached on disk per connection, so table/column/procedure suggestions are available the instant you connect (a fresh catalog loads in the background and swaps in). All completion items are prebuilt off the keystroke path — a keystroke costs a couple of regexes and map lookups.
 
 ## Features
 
@@ -19,6 +19,13 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 - **SQL editing with IntelliSense** — ~250 curated built-in functions with signatures and one-line docs (aggregates, string, math, date/time, JSON, window functions, system) plus SQL keywords. Suggestions adapt to the dialect of the active connection.
 - **Context-aware completion** — after connecting, DB Lite loads the schema in the background: table names after `FROM` / `JOIN` / `INSERT INTO` / `UPDATE`, column names after `alias.` / `table.` / `schema.`, and columns of the tables referenced in the current statement (toggle: `dbtool.schemaCompletion`; refresh with `DB Lite: Refresh Schema`).
 - **JOIN auto-generation** — foreign keys drive JOIN suggestions: after `JOIN ` you get complete clauses like `customers c ON c.id = o.customer_id` for every FK-related table; after `JOIN x ` or `… ON ` the matching condition is suggested (toggle: `dbtool.smartJoins`).
+- **Visual Query Builder** — `DB Lite: Open Query Builder` (`Ctrl+Alt+Q`): drag tables onto a canvas, joins are auto-wired from foreign keys (type editable), tick columns and aggregates, add WHERE filters and sorting — the SQL preview updates live and can be run or inserted into the editor.
+- **Execution plans** — `Ctrl+Alt+Enter` runs the statement with the **actual** plan (`EXPLAIN ANALYZE` on PostgreSQL, `SET STATISTICS XML` on SQL Server) and renders it as a collapsible tree: per-node time bars highlight the hot path, actual vs estimated rows are compared and big misestimates flagged. A live elapsed timer ticks in the status bar while any query runs.
+- **Schema browser** — the connected server expands in the sidebar: tables → columns (with types), views, stored procedures and functions (with parameters). Right-click a table for its first 100 rows; right-click a procedure to view its definition or generate an EXEC/CALL template.
+- **Stored-procedure tooling** — typing `EXEC ` / `CALL ` completes procedure names into ready-to-fill templates with named parameters; procedures and functions also appear in normal completion, the object search, and the schema tree.
+- **Fast object search** — `Ctrl+Alt+T` fuzzy-searches every table, view, procedure and function; pick a table to preview its rows, a routine to open its source.
+- **Semantic SQL coloring** — known tables, columns, aliases, schemas, and functions/procedures are colored by your theme via semantic tokens (toggle: `dbtool.semanticHighlighting`).
+- **Statement snippets** — typing `select` offers `SELECT * FROM ` (uppercase, cursor placed after FROM), plus INSERT/UPDATE/DELETE/COUNT starters.
 - **Auto-UPPERCASE keywords** — type `select ` and it becomes `SELECT ` (toggle: `dbtool.autoUppercaseKeywords`).
 - **Auto table aliases** — after `FROM order_details ` DB Lite suggests `od` (toggle: `dbtool.autoAlias`).
 - **Run queries** — `Ctrl+Enter` (or `Cmd+Enter`) runs the selection (multi-cursor selections run in order), or the whole file if nothing is selected. Multiple statements and multiple result sets are supported; T-SQL `GO` batch separators work.
@@ -39,6 +46,7 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 | `dbtool.autoAlias` | `true` | Suggest table aliases after FROM/JOIN |
 | `dbtool.schemaCompletion` | `true` | Load schema metadata after connect for context-aware completion |
 | `dbtool.smartJoins` | `true` | Generate JOIN/ON clauses from foreign keys |
+| `dbtool.semanticHighlighting` | `true` | Theme-color known tables/columns/aliases/functions in SQL |
 | `dbtool.maxRenderRows` | `1000` | Rows rendered per result set |
 
 ## Getting started
@@ -60,6 +68,9 @@ The status bar shows the active connection; click it to switch.
 | `DB Lite: Disconnect` | Close the active connection |
 | `DB Lite: New SQL Query` | Open an untitled SQL editor (`Ctrl+Alt+N`) |
 | `DB Lite: Run Query` | Run selection / whole file (`Ctrl+Enter`) |
+| `DB Lite: Run with Execution Plan` | Run + visualize the actual plan (`Ctrl+Alt+Enter`) |
+| `DB Lite: Open Query Builder` | Visual drag-and-drop query construction (`Ctrl+Alt+Q`) |
+| `DB Lite: Search Tables & Procedures` | Fuzzy search all schema objects (`Ctrl+Alt+T`) |
 | `DB Lite: Edit / Remove Connection` | Manage saved connections |
 | `DB Lite: Refresh Schema` | Re-load table/column/FK metadata for completions |
 | `DB Lite: Show Logs` | Open the DB Lite output channel (connection/query/schema timings) |

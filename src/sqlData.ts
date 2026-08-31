@@ -48,6 +48,7 @@ export const UPPERCASE_TOKENS: string[] = [
   'FETCH', 'NEXT', 'ROWS', 'ONLY', 'TOP', 'OVER', 'PARTITION', 'RETURNING',
   'LATERAL', 'USING', 'MERGE', 'DECLARE', 'BEGIN', 'COMMIT', 'ROLLBACK',
   'TRUNCATE', 'EXEC', 'USE', 'GO', 'IF', 'WHILE', 'APPLY', 'PIVOT', 'UNPIVOT',
+  'CALL', 'EXPLAIN',
 ];
 
 export const PG_FUNCTIONS: FnDoc[] = [

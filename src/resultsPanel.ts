@@ -44,6 +44,23 @@ export class ResultsPanel {
     p.webview.html = page(renderOutcome(meta, outcome, maxRows), meta);
   }
 
+  /** Execution plan view: plan tree(s) + any data result sets underneath. */
+  static showPlan(
+    meta: ConnectionMeta,
+    planHtml: string,
+    outcome: QueryOutcome | undefined,
+    maxRows: number
+  ): void {
+    const p = this.ensure(meta);
+    p.title = `Plan — ${meta.name}`;
+    const parts = [banner(meta), planHtml];
+    if (outcome && outcome.sets.length) {
+      parts.push('<div class="plan-head" style="margin-top:14px"><b>Results</b></div>');
+      for (const set of outcome.sets) parts.push(renderSet(set, maxRows));
+    }
+    p.webview.html = page(parts.join('\n'), meta);
+  }
+
   static showError(meta: ConnectionMeta, error: unknown): void {
     const p = this.ensure(meta);
     p.title = `Error — ${meta.name}`;
@@ -162,6 +179,21 @@ function page(body: string, meta: ConnectionMeta): string {
          background: var(--head-bg); border-top: 1px solid var(--border);
          font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #agg b { font-weight: 600; }
+  .plan { margin: 8px 0 4px; font-family: var(--vscode-editor-font-family, monospace); }
+  .plan-head { margin: 6px 0; font-family: var(--vscode-font-family); }
+  .pn { margin-left: 0; }
+  .pn-kids { margin-left: 18px; border-left: 1px solid var(--border); padding-left: 8px; }
+  .pn summary { list-style: none; cursor: pointer; }
+  .pn summary::before { content: '▾ '; opacity: .55; }
+  .pn:not([open]) > summary::before { content: '▸ '; }
+  .pn-leaf { padding-left: 13px; }
+  .pn-row { display: flex; justify-content: space-between; gap: 16px; padding: 2px 6px; border-radius: 3px;
+            background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent) var(--pct), transparent var(--pct)); }
+  .pn-row.warm { background: linear-gradient(90deg, rgba(214,143,0,.30) var(--pct), transparent var(--pct)); }
+  .pn-row.hot { background: linear-gradient(90deg, rgba(220,54,54,.35) var(--pct), transparent var(--pct)); }
+  .pn-metrics { opacity: .8; white-space: nowrap; }
+  .pn-detail { padding: 0 6px 2px 20px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mis { color: var(--error); font-size: 11px; }
   </style></head><body>${body}
   <div id="agg" hidden></div>
   <script nonce="${nonce}">${GRID_JS}</script>
