@@ -10,6 +10,10 @@ import { DbKind, DbSession, QueryOutcome } from './types';
 export interface CatalogColumn {
   name: string;
   dataType: string;
+  nullable?: boolean;
+  /** default expression, verbatim from the server */
+  dflt?: string;
+  identity?: boolean;
 }
 
 export interface CatalogTable {
@@ -17,6 +21,8 @@ export interface CatalogTable {
   name: string;
   isView: boolean;
   columns: CatalogColumn[];
+  /** primary key column names, in key order */
+  pk?: string[];
 }
 
 export interface CatalogFk {
@@ -154,18 +160,18 @@ export class Catalog {
   }
 
   toJSON(): SerializedCatalog {
-    return { v: 2, kind: this.kind, tables: this.tables, fks: this.fks, routines: this.routines };
+    return { v: 3, kind: this.kind, tables: this.tables, fks: this.fks, routines: this.routines };
   }
 
   static fromJSON(data: unknown): Catalog | undefined {
     const d = data as SerializedCatalog | undefined;
-    if (!d || d.v !== 2 || !Array.isArray(d.tables) || !Array.isArray(d.fks)) return undefined;
+    if (!d || d.v !== 3 || !Array.isArray(d.tables) || !Array.isArray(d.fks)) return undefined;
     return new Catalog(d.kind, d.tables, d.fks, Array.isArray(d.routines) ? d.routines : []);
   }
 }
 
 export interface SerializedCatalog {
-  v: 2;
+  v: 3;
   kind: DbKind;
   tables: CatalogTable[];
   fks: CatalogFk[];
@@ -174,13 +180,40 @@ export interface SerializedCatalog {
 
 // ------------------------------------------------------------- introspection
 
+/** Modern pg_catalog query: exact types (with lengths), nullability, defaults, identity. PG 10+. */
 const PG_COLUMNS = `
+SELECT ns.nspname, cl.relname, a.attname, format_type(a.atttypid, a.atttypmod),
+       CASE WHEN cl.relkind IN ('v', 'm') THEN 'VIEW' ELSE 'TABLE' END,
+       NOT a.attnotnull,
+       pg_get_expr(d.adbin, d.adrelid),
+       a.attidentity <> ''
+FROM pg_attribute a
+JOIN pg_class cl ON cl.oid = a.attrelid
+JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attnum > 0 AND NOT a.attisdropped
+  AND cl.relkind IN ('r', 'v', 'm', 'p')
+  AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY ns.nspname, cl.relname, a.attnum`;
+
+/** Fallback for very old servers — names and generic types only. */
+const PG_COLUMNS_FALLBACK = `
 SELECT c.table_schema, c.table_name, c.column_name, c.data_type, t.table_type
 FROM information_schema.columns c
 JOIN information_schema.tables t
   ON t.table_schema = c.table_schema AND t.table_name = c.table_name
 WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
 ORDER BY c.table_schema, c.table_name, c.ordinal_position`;
+
+const PG_PKS = `
+SELECT ns.nspname, cl.relname, a.attname
+FROM pg_constraint con
+CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_class cl ON cl.oid = con.conrelid
+JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+WHERE con.contype = 'p'
+ORDER BY con.oid, k.ord`;
 
 const PG_FKS = `
 SELECT sns.nspname, scl.relname, sa.attname, tns.nspname, tcl.relname, ta.attname, con.oid::text
@@ -196,13 +229,25 @@ WHERE con.contype = 'f'
 ORDER BY con.oid, k.ord`;
 
 const MSSQL_COLUMNS = `
-SELECT s.name, o.name, c.name, ty.name, CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'TABLE' END
+SELECT s.name, o.name, c.name, ty.name, CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'TABLE' END,
+       c.is_nullable, dc.definition, c.is_identity, c.max_length, c.precision, c.scale
 FROM sys.objects o
 JOIN sys.schemas s ON s.schema_id = o.schema_id
 JOIN sys.columns c ON c.object_id = o.object_id
 JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
 WHERE o.type IN ('U', 'V')
 ORDER BY s.name, o.name, c.column_id`;
+
+const MSSQL_PKS = `
+SELECT s.name, o.name, c.name
+FROM sys.indexes i
+JOIN sys.objects o ON o.object_id = i.object_id
+JOIN sys.schemas s ON s.schema_id = o.schema_id
+JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.is_primary_key = 1
+ORDER BY s.name, o.name, ic.key_ordinal`;
 
 const MSSQL_FKS = `
 SELECT ps.name, pt.name, pc.name, rs.name, rt.name, rc.name, CAST(fk.object_id AS varchar(20))
@@ -273,16 +318,51 @@ function parsePgArgs(signature: string): CatalogParam[] {
   });
 }
 
+/** Format a SQL Server type with its length/precision/scale. */
+function mssqlType(name: string, maxLen: number, precision: number, scale: number): string {
+  const n = name.toLowerCase();
+  if (n === 'varchar' || n === 'char' || n === 'varbinary' || n === 'binary') {
+    return `${name}(${maxLen < 0 ? 'MAX' : maxLen})`;
+  }
+  if (n === 'nvarchar' || n === 'nchar') {
+    return `${name}(${maxLen < 0 ? 'MAX' : maxLen / 2})`;
+  }
+  if (n === 'decimal' || n === 'numeric') return `${name}(${precision},${scale})`;
+  if (n === 'datetime2' || n === 'time' || n === 'datetimeoffset') return `${name}(${scale})`;
+  return name;
+}
+
+function truthy(v: unknown): boolean {
+  return v === true || v === 1 || v === 't' || v === 'true' || v === '1';
+}
+
 export async function loadCatalog(session: DbSession): Promise<Catalog> {
   const kind = session.meta.kind;
-  const colRows = firstSet(await session.run(kind === 'postgres' ? PG_COLUMNS : MSSQL_COLUMNS));
-  // Foreign keys and routines are nice-to-haves (JOIN generation, SP tooling);
-  // permission errors here must not break table/column completion.
+  let colRows: unknown[][];
+  let pgRich = kind === 'postgres';
+  if (kind === 'postgres') {
+    try {
+      colRows = firstSet(await session.run(PG_COLUMNS));
+    } catch {
+      pgRich = false;
+      colRows = firstSet(await session.run(PG_COLUMNS_FALLBACK));
+    }
+  } else {
+    colRows = firstSet(await session.run(MSSQL_COLUMNS));
+  }
+  // Foreign keys, primary keys and routines are nice-to-haves (JOIN generation,
+  // scripting, SP tooling); permission errors must not break basic completion.
   let fkRows: unknown[][] = [];
   try {
     fkRows = firstSet(await session.run(kind === 'postgres' ? PG_FKS : MSSQL_FKS));
   } catch {
     /* completion degrades gracefully without FKs */
+  }
+  let pkRows: unknown[][] = [];
+  try {
+    pkRows = firstSet(await session.run(kind === 'postgres' ? PG_PKS : MSSQL_PKS));
+  } catch {
+    /* scripting degrades gracefully without PKs */
   }
   let routineRows: unknown[][] = [];
   try {
@@ -294,7 +374,10 @@ export async function loadCatalog(session: DbSession): Promise<Catalog> {
   const tables: CatalogTable[] = [];
   const tableIndex = new Map<string, CatalogTable>();
   for (const r of colRows) {
-    const [schema, table, column, dataType, type] = r.map(String);
+    const schema = String(r[0]);
+    const table = String(r[1]);
+    const column = String(r[2]);
+    const type = String(r[4]);
     const key = `${schema}\0${table}`;
     let t = tableIndex.get(key);
     if (!t) {
@@ -302,7 +385,23 @@ export async function loadCatalog(session: DbSession): Promise<Catalog> {
       tableIndex.set(key, t);
       tables.push(t);
     }
-    t.columns.push({ name: column, dataType });
+    const col: CatalogColumn = { name: column, dataType: String(r[3]) };
+    if (kind === 'mssql') {
+      col.dataType = mssqlType(String(r[3]), Number(r[8]), Number(r[9]), Number(r[10]));
+      col.nullable = truthy(r[5]);
+      if (r[6] != null) col.dflt = String(r[6]);
+      col.identity = truthy(r[7]);
+    } else if (pgRich) {
+      col.nullable = truthy(r[5]);
+      if (r[6] != null) col.dflt = String(r[6]);
+      col.identity = truthy(r[7]);
+    }
+    t.columns.push(col);
+  }
+
+  for (const r of pkRows) {
+    const t = tableIndex.get(`${String(r[0])}\0${String(r[1])}`);
+    if (t) (t.pk ??= []).push(String(r[2]));
   }
 
   const fks: CatalogFk[] = [];

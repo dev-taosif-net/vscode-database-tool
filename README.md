@@ -21,7 +21,10 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 - **JOIN auto-generation** — foreign keys drive JOIN suggestions: after `JOIN ` you get complete clauses like `customers c ON c.id = o.customer_id` for every FK-related table; after `JOIN x ` or `… ON ` the matching condition is suggested (toggle: `dbtool.smartJoins`).
 - **Visual Query Builder** — `DB Lite: Open Query Builder` (`Ctrl+Alt+Q`): drag tables onto a canvas, joins are auto-wired from foreign keys (type editable), tick columns and aggregates, add WHERE filters and sorting — the SQL preview updates live and can be run or inserted into the editor.
 - **Execution plans** — `Ctrl+Alt+Enter` runs the statement with the **actual** plan (`EXPLAIN ANALYZE` on PostgreSQL, `SET STATISTICS XML` on SQL Server) and renders it as a collapsible tree: per-node time bars highlight the hot path, actual vs estimated rows are compared and big misestimates flagged. A live elapsed timer ticks in the status bar while any query runs.
-- **Schema browser** — the connected server expands in the sidebar: tables → columns (with types), views, stored procedures and functions (with parameters). Right-click a table for its first 100 rows; right-click a procedure to view its definition or generate an EXEC/CALL template.
+- **Schema browser** — the connected server expands in the sidebar: tables → columns (with exact types, nullability, defaults, identity), views, stored procedures and functions (with parameters). Right-click a table for its first 100 rows; right-click a procedure to view its definition or generate an EXEC/CALL template.
+- **Object management** — `DB Lite: Create New Object` opens review-ready CREATE scripts (table, view, stored procedure, function, index, schema — correct syntax per engine) and can create a **database** after a confirmation. Right-click a table to **Script as SELECT / INSERT / UPDATE / DELETE / CREATE** (INSERT skips identity columns, UPDATE/DELETE are keyed on the primary key, CREATE is reconstructed from real metadata incl. PKs and FKs; views script their live server definition), or to **Count Rows**.
+- **Destructive operations, guarded** — **Drop Table/View**, **Truncate Table**, **Delete All Rows**, and **Drop Procedure/Function** live in a separate danger section of the context menu. Each one shows the affected row count where relevant, requires a modal confirmation **plus typing the exact object name**, always runs a single fully schema-qualified, fully quoted statement (never CASCADE), is logged, and refreshes the schema afterwards.
+- **Switch database** — `DB Lite: Switch Database` lists the server's databases and reconnects the current (host/user) connection against the one you pick; the status bar shows the active database.
 - **Stored-procedure tooling** — typing `EXEC ` / `CALL ` completes procedure names into ready-to-fill templates with named parameters; procedures and functions also appear in normal completion, the object search, and the schema tree.
 - **Fast object search** — `Ctrl+Alt+T` fuzzy-searches every table, view, procedure and function; pick a table to preview its rows, a routine to open its source.
 - **Semantic SQL coloring** — known tables, columns, aliases, schemas, and functions/procedures are colored by your theme via semantic tokens (toggle: `dbtool.semanticHighlighting`).
@@ -71,6 +74,10 @@ The status bar shows the active connection; click it to switch.
 | `DB Lite: Run with Execution Plan` | Run + visualize the actual plan (`Ctrl+Alt+Enter`) |
 | `DB Lite: Open Query Builder` | Visual drag-and-drop query construction (`Ctrl+Alt+Q`) |
 | `DB Lite: Search Tables & Procedures` | Fuzzy search all schema objects (`Ctrl+Alt+T`) |
+| `DB Lite: Create New Object` | CREATE scripts for table/view/SP/function/index/schema + Create Database |
+| `DB Lite: Switch Database` | Reconnect the current connection against another database |
+| `DB Lite: Count Rows` / `Script as …` | Table utilities (also in the tree context menu) |
+| `DB Lite: Drop / Truncate / Delete All Rows` | Guarded destructive operations (modal + type-the-name confirmation) |
 | `DB Lite: Edit / Remove Connection` | Manage saved connections |
 | `DB Lite: Refresh Schema` | Re-load table/column/FK metadata for completions |
 | `DB Lite: Show Logs` | Open the DB Lite output channel (connection/query/schema timings) |

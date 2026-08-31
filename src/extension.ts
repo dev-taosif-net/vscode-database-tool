@@ -13,7 +13,15 @@ import {
   Catalog, CatalogColumn, CatalogRoutine, CatalogTable,
   definitionSql, execTemplate, loadCatalog, peekSql,
 } from './catalog';
-import { clearAllCatalogCaches, deleteCatalogCache, loadCachedCatalog, saveCatalogCache } from './catalogCache';
+import {
+  countRowsSql, createDatabaseSql, createTableDdl, deleteAllSql, dropRoutineSql, dropTableSql,
+  listDatabasesSql, newFunctionTemplate, newIndexTemplate, newProcedureTemplate, newSchemaTemplate,
+  newTableTemplate, newViewTemplate, scriptDelete, scriptInsert, scriptSelect, scriptUpdate,
+  truncateSql, viewDefinitionSql,
+} from './ddl';
+import {
+  catalogCacheKey, clearAllCatalogCaches, deleteCatalogCache, loadCachedCatalog, saveCatalogCache,
+} from './catalogCache';
 import { planFromMssqlXml, planFromPgJson, PlanTree, renderPlanHtml } from './plan';
 import { disposeLogs, log, showLogs, sqlPreview } from './log';
 
@@ -52,6 +60,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dbtool.peekTable', (n?: TreeNode) => peekTable(n)),
     vscode.commands.registerCommand('dbtool.viewRoutine', (n?: TreeNode) => viewRoutine(n)),
     vscode.commands.registerCommand('dbtool.execRoutine', (n?: TreeNode) => execRoutine(n)),
+    vscode.commands.registerCommand('dbtool.createObject', () => createObject()),
+    vscode.commands.registerCommand('dbtool.switchDatabase', () => switchDatabase()),
+    vscode.commands.registerCommand('dbtool.countRows', (n?: TreeNode) => countRows(n)),
+    vscode.commands.registerCommand('dbtool.scriptSelect', (n?: TreeNode) => scriptTable(n, 'select')),
+    vscode.commands.registerCommand('dbtool.scriptInsert', (n?: TreeNode) => scriptTable(n, 'insert')),
+    vscode.commands.registerCommand('dbtool.scriptUpdate', (n?: TreeNode) => scriptTable(n, 'update')),
+    vscode.commands.registerCommand('dbtool.scriptDelete', (n?: TreeNode) => scriptTable(n, 'delete')),
+    vscode.commands.registerCommand('dbtool.scriptCreate', (n?: TreeNode) => scriptTable(n, 'create')),
+    vscode.commands.registerCommand('dbtool.truncateTable', (n?: TreeNode) => truncateTable(n)),
+    vscode.commands.registerCommand('dbtool.deleteRows', (n?: TreeNode) => deleteAllRows(n)),
+    vscode.commands.registerCommand('dbtool.dropObject', (n?: TreeNode) => dropObject(n)),
+    vscode.commands.registerCommand('dbtool.dropRoutine', (n?: TreeNode) => dropRoutine(n)),
     vscode.commands.registerCommand('dbtool.clearAllData', () => clearAllData()),
     vscode.commands.registerCommand('dbtool.refreshSchema', () => refreshSchema()),
     vscode.commands.registerCommand('dbtool.showLogs', () => showLogs()),
@@ -185,8 +205,9 @@ function kindLabel(kind: DbKind): string {
 
 function updateStatus(): void {
   if (active) {
-    statusItem.text = `$(database) ${active.meta.name}`;
-    statusItem.tooltip = `DB Lite — connected to ${active.meta.name} (${kindLabel(active.meta.kind)}). Click to switch.`;
+    const db = active.meta.database ? ` · ${active.meta.database}` : '';
+    statusItem.text = `$(database) ${active.meta.name}${db}`;
+    statusItem.tooltip = `DB Lite — connected to ${active.meta.name} (${kindLabel(active.meta.kind)}${db}). Click to switch.`;
     statusItem.color = safeColor(active.meta.color);
   } else {
     statusItem.text = '$(database) No DB';
@@ -274,7 +295,7 @@ async function connect(arg?: TreeArg): Promise<void> {
     const session = active;
     if (session) {
       // Instant completions from the disk cache, fresh catalog in the background.
-      void loadCachedCatalog(ctx, meta.id).then((cached) => {
+      void loadCachedCatalog(ctx, catalogCacheKey(meta.id, meta.database)).then((cached) => {
         if (cached && active === session && !activeCatalog) {
           activeCatalog = cached;
           log(`Schema cache hit for ${meta.name}: ${cached.tables.length} tables/views (refreshing in background)`);
@@ -315,7 +336,7 @@ async function refreshCatalog(session: DbSession): Promise<void> {
       `${cat.fks.length} foreign keys, ${cat.routines.length} routines in ${(performance.now() - t0).toFixed(0)} ms`
     );
     catalogUpdated();
-    void saveCatalogCache(ctx, session.meta.id, cat);
+    void saveCatalogCache(ctx, catalogCacheKey(session.meta.id, session.meta.database), cat);
   } catch (e) {
     log(`Schema load failed for ${session.meta.name}: ${(e as Error)?.message ?? e}`);
   }
@@ -577,4 +598,294 @@ async function searchObjects(): Promise<void> {
 
 function openQueryBuilder(): void {
   QueryBuilderPanel.open(ctx, () => activeCatalog, () => active?.meta, (sql) => void runSqlText(sql));
+}
+
+// ------------------------------------------------------- object management
+
+async function openSqlEditor(content: string): Promise<void> {
+  const doc = await vscode.workspace.openTextDocument({ language: 'sql', content });
+  await vscode.window.showTextDocument(doc);
+}
+
+/** Resolve a table from a tree node, or let the user pick one. */
+async function resolveTable(n?: TreeNode): Promise<CatalogTable | undefined> {
+  const fromNode = nodeTable(n);
+  if (fromNode) return fromNode;
+  const cat = activeCatalog;
+  if (!cat) {
+    vscode.window.showWarningMessage('DB Lite: connect first — the schema loads right after connecting.');
+    return undefined;
+  }
+  type Item = vscode.QuickPickItem & { table: CatalogTable };
+  const picked = await vscode.window.showQuickPick<Item>(
+    cat.tables.map((t) => ({
+      label: `$(${t.isView ? 'window' : 'table'}) ${t.name}`,
+      description: t.schema,
+      table: t,
+    })),
+    { placeHolder: 'Which table?' }
+  );
+  return picked?.table;
+}
+
+async function resolveRoutine(n?: TreeNode): Promise<CatalogRoutine | undefined> {
+  const fromNode = nodeRoutine(n);
+  if (fromNode) return fromNode;
+  const cat = activeCatalog;
+  if (!cat) return undefined;
+  type Item = vscode.QuickPickItem & { routine: CatalogRoutine };
+  const picked = await vscode.window.showQuickPick<Item>(
+    cat.routines.map((r) => ({ label: r.name, description: `${r.schema} · ${r.kind}`, routine: r })),
+    { placeHolder: 'Which procedure/function?' }
+  );
+  return picked?.routine;
+}
+
+/**
+ * Two-step guard for destructive statements: a modal warning, then the exact
+ * object name has to be typed back. Returns true only on a perfect match.
+ */
+async function confirmDestructive(title: string, detail: string, confirmName: string): Promise<boolean> {
+  const go = await vscode.window.showWarningMessage(title, { modal: true, detail }, 'Continue');
+  if (go !== 'Continue') return false;
+  const typed = await vscode.window.showInputBox({
+    prompt: `Type the name "${confirmName}" to confirm`,
+    placeHolder: confirmName,
+    validateInput: (v) => (v === confirmName ? undefined : `Type "${confirmName}" exactly to confirm`),
+  });
+  return typed === confirmName;
+}
+
+/** Execute a DDL/destructive statement, then refresh the schema everywhere. */
+async function runDdl(session: DbSession, sql: string, successMsg: string): Promise<boolean> {
+  const stop = startTimer('executing');
+  try {
+    await session.run(sql);
+    log(`DDL on ${session.meta.name}: ${sqlPreview(sql)}`);
+    vscode.window.setStatusBarMessage(`$(check) ${successMsg}`, 5000);
+    if (active === session) void refreshCatalog(session);
+    return true;
+  } catch (e) {
+    log(`DDL on ${session.meta.name} FAILED: ${(e as Error)?.message ?? e} — ${sqlPreview(sql)}`);
+    vscode.window.showErrorMessage(`DB Lite: ${(e as Error)?.message ?? e}`);
+    return false;
+  } finally {
+    stop();
+  }
+}
+
+async function scalar(session: DbSession, sql: string): Promise<unknown> {
+  const res = await session.run(sql);
+  return res.sets.find((s) => s.rows.length)?.rows[0]?.[0];
+}
+
+async function countRows(n?: TreeNode): Promise<void> {
+  const t = await resolveTable(n);
+  const session = active;
+  if (!t || !session) return;
+  const stop = startTimer(`counting ${t.name}`);
+  try {
+    const count = Number(await scalar(session, countRowsSql(t, session.meta.kind)));
+    vscode.window.showInformationMessage(`${t.schema}.${t.name}: ${count.toLocaleString('en-US')} rows`);
+    log(`Count ${t.schema}.${t.name}: ${count}`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`DB Lite: ${(e as Error)?.message ?? e}`);
+  } finally {
+    stop();
+  }
+}
+
+async function scriptTable(
+  n: TreeNode | undefined,
+  mode: 'select' | 'insert' | 'update' | 'delete' | 'create'
+): Promise<void> {
+  const t = await resolveTable(n);
+  const session = active;
+  const cat = activeCatalog;
+  if (!t || !session || !cat) return;
+  const kind = session.meta.kind;
+  if (mode === 'create' && t.isView) {
+    // Views get their real definition from the server.
+    try {
+      const def = String((await scalar(session, viewDefinitionSql(t, kind))) ?? '');
+      if (!def) throw new Error('no definition returned (missing permissions?)');
+      const content =
+        kind === 'postgres'
+          ? `CREATE OR REPLACE VIEW ${t.schema}.${t.name} AS\n${def}`
+          : def;
+      await openSqlEditor(content);
+    } catch (e) {
+      vscode.window.showErrorMessage(`DB Lite: failed to script view — ${(e as Error)?.message ?? e}`);
+    }
+    return;
+  }
+  const script =
+    mode === 'select' ? scriptSelect(t, kind)
+    : mode === 'insert' ? scriptInsert(t, kind)
+    : mode === 'update' ? scriptUpdate(t, kind)
+    : mode === 'delete' ? scriptDelete(t, kind)
+    : createTableDdl(t, kind, cat.fks);
+  await openSqlEditor(script);
+}
+
+async function truncateTable(n?: TreeNode): Promise<void> {
+  const t = await resolveTable(n);
+  const session = active;
+  if (!t || !session) return;
+  if (t.isView) {
+    vscode.window.showWarningMessage('DB Lite: views cannot be truncated.');
+    return;
+  }
+  const count = await rowCountSafe(session, t);
+  const ok = await confirmDestructive(
+    `Truncate table ${t.schema}.${t.name}?`,
+    `This PERMANENTLY deletes ${count ?? 'all'} row(s) on "${session.meta.name}". It cannot be undone.`,
+    t.name
+  );
+  if (!ok) return;
+  if (await runDdl(session, truncateSql(t, session.meta.kind), `Truncated ${t.schema}.${t.name}`)) {
+    log(`TRUNCATE confirmed and executed: ${t.schema}.${t.name} (${count ?? '?'} rows)`);
+  }
+}
+
+async function deleteAllRows(n?: TreeNode): Promise<void> {
+  const t = await resolveTable(n);
+  const session = active;
+  if (!t || !session) return;
+  const count = await rowCountSafe(session, t);
+  const ok = await confirmDestructive(
+    `Delete ALL rows from ${t.schema}.${t.name}?`,
+    `This deletes ${count ?? 'all'} row(s) on "${session.meta.name}" with a single DELETE statement. It cannot be undone.`,
+    t.name
+  );
+  if (!ok) return;
+  await runDdl(session, deleteAllSql(t, session.meta.kind), `Deleted all rows from ${t.schema}.${t.name}`);
+}
+
+async function dropObject(n?: TreeNode): Promise<void> {
+  const t = await resolveTable(n);
+  const session = active;
+  if (!t || !session) return;
+  const label = t.isView ? 'view' : 'table';
+  const ok = await confirmDestructive(
+    `Drop ${label} ${t.schema}.${t.name}?`,
+    `This PERMANENTLY removes the ${label}${t.isView ? '' : ' and ALL of its data'} on "${session.meta.name}". It cannot be undone.`,
+    t.name
+  );
+  if (!ok) return;
+  await runDdl(session, dropTableSql(t, session.meta.kind), `Dropped ${label} ${t.schema}.${t.name}`);
+}
+
+async function dropRoutine(n?: TreeNode): Promise<void> {
+  const r = await resolveRoutine(n);
+  const session = active;
+  if (!r || !session) return;
+  const ok = await confirmDestructive(
+    `Drop ${r.kind} ${r.schema}.${r.name}?`,
+    `This PERMANENTLY removes the ${r.kind} on "${session.meta.name}". It cannot be undone.`,
+    r.name
+  );
+  if (!ok) return;
+  await runDdl(session, dropRoutineSql(r, session.meta.kind), `Dropped ${r.kind} ${r.schema}.${r.name}`);
+}
+
+async function rowCountSafe(session: DbSession, t: CatalogTable): Promise<string | undefined> {
+  try {
+    const c = Number(await scalar(session, countRowsSql(t, session.meta.kind)));
+    return Number.isFinite(c) ? c.toLocaleString('en-US') : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ------------------------------------------------------- create / databases
+
+async function createObject(): Promise<void> {
+  const kind = active?.meta.kind ?? 'postgres';
+  type Item = vscode.QuickPickItem & { make?: (k: DbKind) => string; db?: boolean };
+  const items: Item[] = [
+    { label: '$(table) Table', description: 'CREATE TABLE script', make: newTableTemplate },
+    { label: '$(window) View', description: 'CREATE VIEW script', make: newViewTemplate },
+    { label: '$(symbol-method) Stored Procedure', description: kind === 'mssql' ? 'CREATE OR ALTER PROCEDURE script' : 'CREATE PROCEDURE script', make: newProcedureTemplate },
+    { label: '$(symbol-function) Function', description: 'CREATE FUNCTION script', make: newFunctionTemplate },
+    { label: '$(list-tree) Index', description: 'CREATE INDEX script', make: newIndexTemplate },
+    { label: '$(symbol-namespace) Schema', description: 'CREATE SCHEMA script', make: newSchemaTemplate },
+    { label: '$(database) Database…', description: 'prompts for a name, then creates it', db: true },
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: `Create new object (${kindLabel(kind)} syntax)…`,
+  });
+  if (!picked) return;
+  if (picked.db) {
+    await createDatabase();
+    return;
+  }
+  // Scripts open in an editor for review — nothing is executed automatically.
+  await openSqlEditor(picked.make!(kind));
+}
+
+async function createDatabase(): Promise<void> {
+  const session = await ensureSession();
+  if (!session) return;
+  const name = await vscode.window.showInputBox({
+    prompt: `New database name on "${session.meta.name}" (${kindLabel(session.meta.kind)})`,
+    validateInput: (v) => {
+      if (!v.trim()) return 'Name is required';
+      if (v.length > 128) return 'Name is too long';
+      // Strict quoting makes any printable name safe; still block control chars.
+      if (/[\x00-\x1f\x7f]/.test(v)) return 'Name contains control characters';
+      return undefined;
+    },
+  });
+  if (!name) return;
+  const ok = await vscode.window.showWarningMessage(
+    `Create database "${name}" on "${session.meta.name}"?`,
+    { modal: true },
+    'Create'
+  );
+  if (ok !== 'Create') return;
+  await runDdl(session, createDatabaseSql(name, session.meta.kind), `Created database ${name}`);
+}
+
+/** Reconnect the current fields-mode connection against another database. */
+async function switchDatabase(): Promise<void> {
+  const session = await ensureSession();
+  if (!session) return;
+  if (session.meta.mode === 'string') {
+    vscode.window.showWarningMessage(
+      'DB Lite: switching databases is only supported for host/user connections — edit the connection string instead.'
+    );
+    return;
+  }
+  let names: string[];
+  try {
+    const res = await session.run(listDatabasesSql(session.meta.kind));
+    names = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
+  } catch (e) {
+    vscode.window.showErrorMessage(`DB Lite: could not list databases — ${(e as Error)?.message ?? e}`);
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    names.map((n) => ({
+      label: `$(database) ${n}`,
+      description: n === session.meta.database ? 'current' : undefined,
+      name: n,
+    })),
+    { placeHolder: `Switch database on ${session.meta.name}…` }
+  );
+  if (!picked || picked.name === session.meta.database) return;
+  const secret = (await store.secret(session.meta.id)) ?? '';
+  const meta: ConnectionMeta = { ...session.meta, database: picked.name };
+  try {
+    const { openSession } = await import('./drivers');
+    const next = await openSession(meta, secret);
+    await active?.dispose().catch(() => undefined);
+    active = next;
+    activeCatalog = undefined;
+    log(`Switched to database ${picked.name} on ${meta.name}`);
+    refreshUi();
+    void refreshCatalog(next);
+  } catch (e) {
+    vscode.window.showErrorMessage(`DB Lite: failed to switch database — ${(e as Error)?.message ?? e}`);
+  }
 }

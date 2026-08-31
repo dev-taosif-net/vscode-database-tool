@@ -8,8 +8,13 @@ import { Catalog } from './catalog';
  * Only non-secret metadata (object names/types) is stored.
  */
 
-function cacheUri(ctx: vscode.ExtensionContext, connId: string): vscode.Uri {
-  return vscode.Uri.joinPath(ctx.globalStorageUri, `schema-${connId}.json`);
+function cacheUri(ctx: vscode.ExtensionContext, key: string): vscode.Uri {
+  return vscode.Uri.joinPath(ctx.globalStorageUri, `schema-${key}.json`);
+}
+
+/** Cache key: connection id + database, so switching databases never serves a stale catalog. */
+export function catalogCacheKey(connId: string, database: string | undefined): string {
+  return `${connId}-${(database ?? '').replace(/[^\w.-]/g, '_')}`;
 }
 
 export async function loadCachedCatalog(
@@ -40,9 +45,15 @@ export async function saveCatalogCache(
   }
 }
 
+/** Delete every cached catalog of one connection (all databases). */
 export async function deleteCatalogCache(ctx: vscode.ExtensionContext, connId: string): Promise<void> {
   try {
-    await vscode.workspace.fs.delete(cacheUri(ctx, connId));
+    const entries = await vscode.workspace.fs.readDirectory(ctx.globalStorageUri);
+    for (const [name] of entries) {
+      if (name.startsWith(`schema-${connId}`) && name.endsWith('.json')) {
+        await vscode.workspace.fs.delete(vscode.Uri.joinPath(ctx.globalStorageUri, name));
+      }
+    }
   } catch {
     /* may not exist */
   }
