@@ -2,7 +2,7 @@
   "name": "db-lite",
   "displayName": "DB Lite",
   "description": "Super fast, lightweight SQL client for PostgreSQL and Microsoft SQL Server. Write SQL with built-in function suggestions, execute, and view results instantly. Connections stored securely in the OS keychain.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "taosif",
   "license": "MIT",
   "author": "Taosif",

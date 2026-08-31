@@ -4,6 +4,7 @@ import { ConnectionMeta, DbKind, DbSession, QueryOutcome } from './types';
 import { registerCompletions, CompletionApi } from './completion';
 import { registerKeywordUppercase } from './keywordCase';
 import { registerSemanticTokens, SemanticApi } from './semanticTokens';
+import { registerSignatureHelp } from './signatureHelp';
 import { ResultsPanel } from './resultsPanel';
 import { ConnectionFormPanel } from './connectionForm';
 import { QueryBuilderPanel } from './queryBuilder';
@@ -80,6 +81,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   completionApi = registerCompletions(context, () => active?.meta.kind, () => activeCatalog);
   semanticApi = registerSemanticTokens(context, () => activeCatalog);
+  registerSignatureHelp(context, () => active?.meta.kind, () => activeCatalog);
   registerKeywordUppercase(context);
 }
 

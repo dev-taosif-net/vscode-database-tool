@@ -372,9 +372,20 @@ function routineItem(cat: Catalog, r: CatalogRoutine, forExec: boolean): vscode.
   );
   const q = qualify2(r.schema, r.name, cat);
   const inputs = r.params.filter((p) => !p.output);
-  item.detail = r.signature
-    ? `${r.kind}(${r.signature})`
-    : `${r.kind}(${r.params.map((p) => `${p.name} ${p.dataType}${p.output ? ' OUTPUT' : ''}`).join(', ')})`;
+  const sig = r.signature
+    ?? r.params.map((p) => `${p.name} ${p.dataType}${p.output ? ' OUTPUT' : ''}`).join(', ');
+  item.detail = `${r.kind}(${sig})${r.returns ? ` → ${r.returns}` : ''}`;
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(`${r.schema}.${r.name}(${sig})`, 'sql');
+  md.appendMarkdown(`${r.kind === 'procedure' ? 'Stored procedure' : 'User-defined function'} in schema \`${r.schema}\`.`);
+  if (r.params.length) {
+    md.appendMarkdown('\n\n**Parameters:**\n');
+    for (const p of r.params) {
+      md.appendMarkdown(`\n- \`${p.name || '(unnamed)'}\` — ${p.dataType}${p.output ? ' *(OUTPUT)*' : ''}`);
+    }
+  }
+  if (r.returns) md.appendMarkdown(`\n\n**Returns:** \`${r.returns}\``);
+  item.documentation = md;
   if (forExec) {
     // Ready-to-fill template: EXEC dbo.proc @a = ¦, @b = ¦  /  CALL fn(¦, ¦)
     if (cat.kind === 'mssql') {
@@ -514,13 +525,16 @@ function buildStatic(kind: DbKind | undefined): vscode.CompletionItem[] {
 }
 
 function addFunctions(items: vscode.CompletionItem[], fns: FnDoc[], dialect: string): void {
-  for (const [name, signature, doc] of fns) {
+  for (const [name, signature, doc, returns] of fns) {
     const item = new vscode.CompletionItem(
       { label: name, description: dialect },
       vscode.CompletionItemKind.Function
     );
-    item.detail = signature;
-    item.documentation = new vscode.MarkdownString(doc);
+    item.detail = `${signature} → ${returns}`;
+    const md = new vscode.MarkdownString();
+    md.appendCodeblock(signature, 'sql');
+    md.appendMarkdown(`${doc}\n\n**Returns:** \`${returns}\``);
+    item.documentation = md;
     item.sortText = '1' + name.toLowerCase();
     if (signature.startsWith(name + '()')) {
       // Zero-argument function: place cursor after the closing paren.

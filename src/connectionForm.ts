@@ -85,11 +85,11 @@ export class ConnectionFormPanel {
   }
 
   private static buildMeta(d: FormData): ConnectionMeta | undefined {
-    const fail = (message: string) => {
-      this.panel?.webview.postMessage({ type: 'status', ok: false, message });
+    const fail = (message: string, field?: string) => {
+      this.panel?.webview.postMessage({ type: 'status', ok: false, message, field });
       return undefined;
     };
-    if (!d.name?.trim()) return fail('Name is required.');
+    if (!d.name?.trim()) return fail('Name is required.', 'name');
     const timeoutSec = Math.min(600, Math.max(1, parseInt(d.timeoutSec, 10) || 10));
     const meta: ConnectionMeta = {
       id: this.existing?.id ?? (require('crypto').randomUUID() as string),
@@ -100,9 +100,9 @@ export class ConnectionFormPanel {
       timeoutSec,
     };
     if (meta.mode === 'fields') {
-      if (!d.host?.trim()) return fail('Host is required.');
+      if (!d.host?.trim()) return fail('Host is required.', 'host');
       const port = parseInt(d.port, 10);
-      if (!port) return fail('Port must be a number.');
+      if (!port) return fail('Port must be a number.', 'port');
       meta.host = d.host.trim();
       meta.port = port;
       meta.database = d.database?.trim() || undefined;
@@ -114,7 +114,7 @@ export class ConnectionFormPanel {
         meta.trustCert = d.enc === 'trust';
       }
     } else if (!d.secret && !this.existing) {
-      return fail('Connection string is required.');
+      return fail('Connection string is required.', 'connString');
     }
     return meta;
   }
@@ -209,6 +209,9 @@ input:focus, select:focus { outline: 1px solid var(--accent); }
 .swatch-row .none.selected { border-color: var(--fg); }
 input[type=color] { width: 34px; height: 28px; padding: 0 2px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 2px; cursor: pointer; }
 .hint { opacity: .6; font-size: 12px; margin-top: 4px; }
+.req { color: var(--error); font-weight: 700; margin-left: 2px; }
+input.invalid, select.invalid { border-color: var(--error) !important; outline: 1px solid var(--error) !important; }
+label.invalid-label { color: var(--error); opacity: 1; }
 .actions { display: flex; gap: 10px; margin-top: 22px; align-items: center; }
 button.primary, button.secondary { padding: 6px 16px; font-size: 13px; border: none; border-radius: 2px; cursor: pointer; }
 button.primary { background: var(--accent); color: var(--accent-fg, #fff); }
@@ -221,8 +224,9 @@ legend { padding: 0 4px; opacity: .8; font-size: 12px; }
 .hidden { display: none; }
 </style></head><body>
 <h1 id="title"></h1>
+<div class="hint">Fields marked <span class="req">*</span> are required.</div>
 
-<label>Name</label>
+<label for="name">Name<span class="req" title="Required">*</span></label>
 <input type="text" id="name" placeholder="e.g. prod-postgres, local-mssql">
 
 <label>Database type</label>
@@ -253,8 +257,8 @@ legend { padding: 0 4px; opacity: .8; font-size: 12px; }
 
 <fieldset id="fieldsSection"><legend>Server</legend>
   <div class="row">
-    <div><label>Host</label><input type="text" id="host"></div>
-    <div style="max-width:110px"><label>Port</label><input type="number" id="port"></div>
+    <div><label for="host">Host<span class="req" title="Required">*</span></label><input type="text" id="host"></div>
+    <div style="max-width:110px"><label for="port">Port<span class="req" title="Required">*</span></label><input type="number" id="port"></div>
   </div>
   <label>Database</label><input type="text" id="database">
   <label>User</label><input type="text" id="user">
@@ -278,7 +282,7 @@ legend { padding: 0 4px; opacity: .8; font-size: 12px; }
   </div>
 </fieldset>
 
-<fieldset id="stringSection"><legend>Connection string</legend>
+<fieldset id="stringSection"><legend>Connection string<span class="req" id="csReq" title="Required">*</span></legend>
   <input type="password" id="connString" autocomplete="off">
   <div class="hint" id="csHint"></div>
   <label style="margin-top:8px"><input type="checkbox" id="showCs"> Show connection string</label>
@@ -355,8 +359,42 @@ function collect() {
     secret: mode() === 'string' ? $('connString').value.trim() : $('password').value,
   };
 }
-$('save').addEventListener('click', () => vscode.postMessage({ type: 'save', data: collect() }));
-$('test').addEventListener('click', () => vscode.postMessage({ type: 'test', data: collect() }));
+// ---------------------------------------------------- required-field checks
+function markInvalid(id, bad) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.toggle('invalid', bad);
+  const label = document.querySelector('label[for=' + id + ']');
+  if (label) label.classList.toggle('invalid-label', bad);
+}
+function requiredFields() {
+  const req = ['name'];
+  if (mode() === 'fields') req.push('host', 'port');
+  else if (!init.hasSecret) req.push('connString');
+  return req;
+}
+function validate() {
+  let firstBad = null;
+  for (const id of requiredFields()) {
+    const bad = !$(id).value.trim();
+    markInvalid(id, bad);
+    if (bad && !firstBad) firstBad = $(id);
+  }
+  if (firstBad) {
+    const s = $('status');
+    s.textContent = 'Please fill in the required fields (*).';
+    s.className = 'err';
+    firstBad.focus();
+    return false;
+  }
+  return true;
+}
+['name', 'host', 'port', 'connString'].forEach((id) =>
+  $(id).addEventListener('input', () => { markInvalid(id, false); }));
+$('csReq').style.display = init.hasSecret ? 'none' : '';
+
+$('save').addEventListener('click', () => { if (validate()) vscode.postMessage({ type: 'save', data: collect() }); });
+$('test').addEventListener('click', () => { if (validate()) vscode.postMessage({ type: 'test', data: collect() }); });
 $('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
 
 window.addEventListener('message', (e) => {
@@ -364,6 +402,7 @@ window.addEventListener('message', (e) => {
     const s = $('status');
     s.textContent = e.data.message;
     s.className = e.data.ok ? 'ok' : 'err';
+    if (e.data.field) { markInvalid(e.data.field, true); $(e.data.field).focus(); }
   }
 });
 </script></body></html>`;

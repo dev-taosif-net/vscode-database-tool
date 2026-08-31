@@ -47,6 +47,8 @@ export interface CatalogRoutine {
   params: CatalogParam[];
   /** raw signature text (postgres identity arguments), when available */
   signature?: string;
+  /** return type ('table' for table-valued functions), when known */
+  returns?: string;
 }
 
 /** A table reachable from `t` via one foreign key (either direction). */
@@ -264,7 +266,8 @@ ORDER BY fk.object_id, fkc.constraint_column_id`;
 const PG_ROUTINES = `
 SELECT n.nspname, p.proname,
        CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
-       pg_get_function_identity_arguments(p.oid)
+       pg_get_function_identity_arguments(p.oid),
+       COALESCE(pg_get_function_result(p.oid), '')
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND p.prokind IN ('f', 'p')
@@ -273,7 +276,8 @@ ORDER BY n.nspname, p.proname`;
 const MSSQL_ROUTINES = `
 SELECT s.name, o.name,
        CASE o.type WHEN 'P' THEN 'procedure' ELSE 'function' END,
-       p.name, TYPE_NAME(p.user_type_id), p.is_output, p.parameter_id
+       p.name, TYPE_NAME(p.user_type_id), p.is_output, p.parameter_id,
+       RTRIM(o.type)
 FROM sys.objects o
 JOIN sys.schemas s ON s.schema_id = o.schema_id
 LEFT JOIN sys.parameters p ON p.object_id = o.object_id
@@ -421,19 +425,20 @@ export async function loadCatalog(session: DbSession): Promise<Catalog> {
   const routines: CatalogRoutine[] = [];
   if (kind === 'postgres') {
     for (const r of routineRows) {
-      const [schema, name, rkind, signature] = r.map(String);
+      const [schema, name, rkind, signature, returns] = r.map((v) => String(v ?? ''));
       routines.push({
         schema,
         name,
         kind: rkind === 'procedure' ? 'procedure' : 'function',
         params: parsePgArgs(signature),
         signature,
+        returns: returns || undefined,
       });
     }
   } else {
     const rIndex = new Map<string, CatalogRoutine>();
     for (const r of routineRows) {
-      const [schema, name, rkind, pName, pType, pOutput] = r as unknown[];
+      const [schema, name, rkind, pName, pType, pOutput, pId, objType] = r as unknown[];
       const key = `${schema}\0${name}`;
       let routine = rIndex.get(key);
       if (!routine) {
@@ -443,16 +448,20 @@ export async function loadCatalog(session: DbSession): Promise<Catalog> {
           kind: rkind === 'procedure' ? 'procedure' : 'function',
           params: [],
         };
+        // Table-valued functions (inline or multi-statement) return a table.
+        if (objType === 'IF' || objType === 'TF') routine.returns = 'table';
         rIndex.set(key, routine);
         routines.push(routine);
       }
-      // parameter_id 0 is a function's return value (empty name) — skip it.
+      // parameter_id 0 is a scalar function's return value (empty name).
       if (pName != null && String(pName)) {
         routine.params.push({
           name: String(pName),
           dataType: String(pType ?? ''),
           output: pOutput === true || pOutput === 1,
         });
+      } else if (Number(pId) === 0 && pType != null && !routine.returns) {
+        routine.returns = String(pType);
       }
     }
   }
