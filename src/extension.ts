@@ -6,6 +6,9 @@ import { registerKeywordUppercase } from './keywordCase';
 import { registerSemanticTokens, SemanticApi } from './semanticTokens';
 import { registerSignatureHelp } from './signatureHelp';
 import { ResultsPanel } from './resultsPanel';
+import { ResultsTerminal } from './resultsTerminal';
+import { ResultsView } from './resultsView';
+import { ConnectionBarApi, registerConnectionBar } from './connectionBar';
 import { ConnectionFormPanel } from './connectionForm';
 import { QueryBuilderPanel } from './queryBuilder';
 import { connectionIcon, clearIcons } from './colorIcons';
@@ -15,10 +18,10 @@ import {
   definitionSql, execTemplate, loadCatalog, peekSql,
 } from './catalog';
 import {
-  countRowsSql, createDatabaseSql, createTableDdl, deleteAllSql, dropRoutineSql, dropTableSql,
-  listDatabasesSql, newFunctionTemplate, newIndexTemplate, newProcedureTemplate, newSchemaTemplate,
-  newTableTemplate, newViewTemplate, scriptDelete, scriptInsert, scriptSelect, scriptUpdate,
-  truncateSql, viewDefinitionSql,
+  countRowsSql, createDatabaseSql, createTableDdl, currentDatabaseSql, deleteAllSql, dropRoutineSql,
+  dropTableSql, listDatabasesSql, newFunctionTemplate, newIndexTemplate, newProcedureTemplate,
+  newSchemaTemplate, newTableTemplate, newViewTemplate, scriptDelete, scriptInsert, scriptSelect,
+  scriptUpdate, truncateSql, viewDefinitionSql,
 } from './ddl';
 import {
   catalogCacheKey, clearAllCatalogCaches, deleteCatalogCache, loadCachedCatalog, saveCatalogCache,
@@ -26,25 +29,68 @@ import {
 import { planFromMssqlXml, planFromPgJson, PlanTree, renderPlanHtml } from './plan';
 import { disposeLogs, log, showLogs, sqlPreview } from './log';
 
+/**
+ * One open connection: a live session plus everything loaded around it.
+ * Several can be open at once — each SQL tab can be bound to its own (tabConns),
+ * while `active` drives the explorer tree and is the default for new tabs.
+ */
+interface Conn {
+  /** Pool key: connection id + attached database. */
+  key: string;
+  session: DbSession;
+  catalog?: Catalog;
+  /** All databases on the server (fields-mode) and the one we're attached to. */
+  databases: string[];
+  currentDb?: string;
+}
+
 let ctx: vscode.ExtensionContext;
 let store: ConnectionStore;
-let active: DbSession | undefined;
-let activeCatalog: Catalog | undefined;
-let statusItem: vscode.StatusBarItem;
+let active: Conn | undefined;
+/** Open sessions by pool key — connecting to another server/database keeps existing ones alive. */
+const conns = new Map<string, Conn>();
+/** SQL editor tab (document uri) → the connection its queries run on. */
+const tabConns = new Map<string, Conn>();
 let completionApi: CompletionApi;
 let semanticApi: SemanticApi;
+let connectionBar: ConnectionBarApi;
 const treeChanged = new vscode.EventEmitter<TreeNode | undefined | void>();
+
+function connKey(meta: ConnectionMeta): string {
+  return `${meta.id}\0${meta.database ?? ''}`;
+}
+
+/** The connection the active editor's tab is bound to, falling back to the shared active one. */
+function editorConn(): Conn | undefined {
+  const doc = vscode.window.activeTextEditor?.document;
+  return (doc && tabConns.get(doc.uri.toString())) ?? active;
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   ctx = context;
   store = new ConnectionStore(context);
   ResultsPanel.init(context);
+  ResultsView.register(context);
 
-  statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
-  statusItem.command = 'dbtool.connect';
-  updateStatus();
-  statusItem.show();
-  context.subscriptions.push(statusItem, treeChanged);
+  context.subscriptions.push(treeChanged);
+
+  // Per-tab connection bar (CodeLens + env-color line tint) in every SQL editor.
+  connectionBar = registerConnectionBar(context, (doc) => {
+    const conn = tabConns.get(doc.uri.toString());
+    const c = conn ?? active;
+    if (!c) return undefined;
+    const meta = c.session.meta;
+    return {
+      name: meta.name,
+      user: meta.user,
+      database: c.currentDb ?? meta.database,
+      color: meta.color,
+      bound: !!conn,
+    };
+  });
+  context.subscriptions.push(
+    vscode.workspace.onDidCloseTextDocument((doc) => tabConns.delete(doc.uri.toString()))
+  );
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('dbtool.connections', treeProvider),
@@ -53,7 +99,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dbtool.connect', (item?: TreeArg) => connect(item)),
     vscode.commands.registerCommand('dbtool.disconnect', () => disconnect()),
     vscode.commands.registerCommand('dbtool.removeConnection', (item?: TreeArg) => removeConnection(item)),
-    vscode.commands.registerCommand('dbtool.newQuery', () => newQuery()),
+    vscode.commands.registerCommand('dbtool.newQuery', (item?: TreeArg) => newQuery(item)),
+    vscode.commands.registerCommand('dbtool.tabConnection', (uri?: vscode.Uri) => pickTabConnection(uri)),
     vscode.commands.registerCommand('dbtool.runQuery', () => runQuery()),
     vscode.commands.registerCommand('dbtool.explainQuery', () => explainQuery()),
     vscode.commands.registerCommand('dbtool.queryBuilder', () => openQueryBuilder()),
@@ -62,7 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dbtool.viewRoutine', (n?: TreeNode) => viewRoutine(n)),
     vscode.commands.registerCommand('dbtool.execRoutine', (n?: TreeNode) => execRoutine(n)),
     vscode.commands.registerCommand('dbtool.createObject', () => createObject()),
-    vscode.commands.registerCommand('dbtool.switchDatabase', () => switchDatabase()),
+    vscode.commands.registerCommand('dbtool.switchDatabase', (n?: TreeNode) => switchDatabase(n)),
     vscode.commands.registerCommand('dbtool.countRows', (n?: TreeNode) => countRows(n)),
     vscode.commands.registerCommand('dbtool.scriptSelect', (n?: TreeNode) => scriptTable(n, 'select')),
     vscode.commands.registerCommand('dbtool.scriptInsert', (n?: TreeNode) => scriptTable(n, 'insert')),
@@ -79,14 +126,30 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: disposeLogs }
   );
 
-  completionApi = registerCompletions(context, () => active?.meta.kind, () => activeCatalog);
-  semanticApi = registerSemanticTokens(context, () => activeCatalog);
-  registerSignatureHelp(context, () => active?.meta.kind, () => activeCatalog);
+  // Language features follow the active editor's tab connection.
+  completionApi = registerCompletions(
+    context,
+    () => editorConn()?.session.meta.kind,
+    () => editorConn()?.catalog,
+    () => {
+      const c = editorConn();
+      return { names: c?.databases ?? [], current: c?.currentDb ?? c?.session.meta.database };
+    }
+  );
+  semanticApi = registerSemanticTokens(context, () => editorConn()?.catalog);
+  registerSignatureHelp(context, () => editorConn()?.session.meta.kind, () => editorConn()?.catalog);
   registerKeywordUppercase(context);
+  // Switching tabs may switch catalogs — re-color and refresh the bar.
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      semanticApi.refresh();
+      connectionBar.refresh();
+    })
+  );
 }
 
 export async function deactivate(): Promise<void> {
-  await active?.dispose().catch(() => undefined);
+  await Promise.all([...conns.values()].map((c) => c.session.dispose().catch(() => undefined)));
 }
 
 // ------------------------------------------------------------------ tree view
@@ -95,6 +158,7 @@ type TreeArg = string | { id?: string } | TreeNode | undefined;
 
 type TreeNode =
   | { t: 'conn'; meta: ConnectionMeta }
+  | { t: 'db'; name: string; current: boolean }
   | { t: 'grp'; label: string; icon: string; children: TreeNode[] }
   | { t: 'table'; table: CatalogTable }
   | { t: 'col'; table: CatalogTable; col: CatalogColumn }
@@ -110,8 +174,14 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
         .map((meta): TreeNode => ({ t: 'conn', meta }));
     }
     if (el.t === 'conn') {
-      if (active?.meta.id !== el.meta.id || !activeCatalog) return [];
-      return schemaGroups(activeCatalog);
+      // connection → databases → tables / views / procedures / functions
+      if (active?.session.meta.id !== el.meta.id || !active.catalog) return [];
+      const cur = active.currentDb ?? active.session.meta.database ?? '';
+      const names = active.databases.length ? active.databases : [cur];
+      return names.map((name): TreeNode => ({ t: 'db', name, current: name === cur }));
+    }
+    if (el.t === 'db') {
+      return el.current && active?.catalog ? schemaGroups(active.catalog) : [];
     }
     if (el.t === 'grp') return el.children;
     if (el.t === 'table') {
@@ -123,6 +193,24 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
     switch (n.t) {
       case 'conn':
         return connTreeItem(n.meta);
+      case 'db': {
+        const item = new vscode.TreeItem(
+          n.name || '(default database)',
+          n.current ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None
+        );
+        item.iconPath = n.current
+          ? new vscode.ThemeIcon('database', new vscode.ThemeColor('charts.green'))
+          : new vscode.ThemeIcon('database');
+        item.description = n.current ? 'current' : undefined;
+        item.contextValue = n.current ? 'databaseCurrent' : 'database';
+        item.tooltip = n.current
+          ? `${n.name} — connected database`
+          : `${n.name} — click to switch to this database`;
+        if (!n.current) {
+          item.command = { command: 'dbtool.switchDatabase', title: 'Switch Database', arguments: [n] };
+        }
+        return item;
+      }
       case 'grp': {
         const item = new vscode.TreeItem(n.label, vscode.TreeItemCollapsibleState.Collapsed);
         item.iconPath = new vscode.ThemeIcon(n.icon);
@@ -130,10 +218,12 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
         return item;
       }
       case 'table': {
-        const item = new vscode.TreeItem(n.table.name, vscode.TreeItemCollapsibleState.Collapsed);
+        // SSMS-style schema-qualified label: approval.ApprovalApplicationHistory
+        const item = new vscode.TreeItem(
+          `${n.table.schema}.${n.table.name}`,
+          vscode.TreeItemCollapsibleState.Collapsed
+        );
         item.iconPath = new vscode.ThemeIcon(n.table.isView ? 'window' : 'table');
-        const cat = activeCatalog;
-        if (cat && n.table.schema.toLowerCase() !== cat.defaultSchema) item.description = n.table.schema;
         item.contextValue = 'table';
         item.tooltip = `${n.table.schema}.${n.table.name} — ${n.table.columns.length} columns`;
         return item;
@@ -146,7 +236,7 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
       }
       case 'routine': {
         const r = n.routine;
-        const item = new vscode.TreeItem(r.name, vscode.TreeItemCollapsibleState.None);
+        const item = new vscode.TreeItem(`${r.schema}.${r.name}`, vscode.TreeItemCollapsibleState.None);
         item.iconPath = new vscode.ThemeIcon(r.kind === 'procedure' ? 'symbol-method' : 'symbol-function');
         item.description =
           r.signature ?? r.params.map((p) => p.name || p.dataType).join(', ');
@@ -175,15 +265,16 @@ function schemaGroups(cat: Catalog): TreeNode[] {
 }
 
 async function connTreeItem(c: ConnectionMeta): Promise<vscode.TreeItem> {
-  const isActive = active?.meta.id === c.id;
+  const isActive = active?.session.meta.id === c.id;
+  const isOpen = [...conns.values()].some((cn) => cn.session.meta.id === c.id);
   const item = new vscode.TreeItem(
     c.name,
-    isActive && activeCatalog
+    isActive && active?.catalog
       ? vscode.TreeItemCollapsibleState.Expanded
       : vscode.TreeItemCollapsibleState.None
   );
   item.id = c.id;
-  item.description = kindLabel(c.kind) + (isActive ? ' • connected' : '');
+  item.description = kindLabel(c.kind) + (isActive ? ' • current' : isOpen ? ' • connected' : '');
   item.tooltip = c.mode === 'string'
     ? `${c.name} (${kindLabel(c.kind)}, connection string)`
     : `${c.name} — ${c.user ?? ''}@${c.host ?? ''}:${c.port ?? ''}/${c.database ?? ''}`;
@@ -205,22 +296,9 @@ function kindLabel(kind: DbKind): string {
   return kind === 'postgres' ? 'PostgreSQL' : 'SQL Server';
 }
 
-function updateStatus(): void {
-  if (active) {
-    const db = active.meta.database ? ` · ${active.meta.database}` : '';
-    statusItem.text = `$(database) ${active.meta.name}${db}`;
-    statusItem.tooltip = `DB Lite — connected to ${active.meta.name} (${kindLabel(active.meta.kind)}${db}). Click to switch.`;
-    statusItem.color = safeColor(active.meta.color);
-  } else {
-    statusItem.text = '$(database) No DB';
-    statusItem.tooltip = 'DB Lite — click to connect to a database';
-    statusItem.color = undefined;
-  }
-}
-
 function refreshUi(): void {
-  updateStatus();
   treeChanged.fire();
+  connectionBar.refresh();
 }
 
 /** Live elapsed-time ticker in the status bar while a query runs. */
@@ -257,9 +335,10 @@ async function pickConnection(placeHolder: string): Promise<ConnectionMeta | und
     return undefined;
   }
   type Item = vscode.QuickPickItem & { meta?: ConnectionMeta; add?: boolean };
+  const connected = new Set([...conns.values()].map((c) => c.session.meta.id));
   const items: Item[] = list.map((c) => ({
     label: `$(database) ${c.name}`,
-    description: kindLabel(c.kind) + (active?.meta.id === c.id ? ' • connected' : ''),
+    description: kindLabel(c.kind) + (connected.has(c.id) ? ' • connected' : ''),
     detail: c.mode === 'string' ? 'connection string' : `${c.user ?? ''}@${c.host ?? ''}/${c.database ?? ''}`,
     meta: c,
   }));
@@ -273,39 +352,45 @@ async function pickConnection(placeHolder: string): Promise<ConnectionMeta | und
   return picked.meta;
 }
 
+/** Open (or reuse) a pooled session for `meta`, kicking off catalog + database loads. */
+async function openConn(meta: ConnectionMeta): Promise<Conn> {
+  const key = connKey(meta);
+  const existing = conns.get(key);
+  if (existing) return existing;
+  const secret = (await store.secret(meta.id)) ?? '';
+  const t0 = performance.now();
+  // Lazy driver load happens inside openSession — first connect pays it, activation never does.
+  const { openSession } = await import('./drivers');
+  const session = await openSession(meta, secret);
+  const conn: Conn = { key, session, databases: [] };
+  conns.set(key, conn);
+  log(`Connected to ${meta.name} (${kindLabel(meta.kind)}) in ${(performance.now() - t0).toFixed(0)} ms`);
+  // Instant completions from the disk cache, fresh catalog in the background.
+  void loadCachedCatalog(ctx, catalogCacheKey(meta.id, meta.database)).then((cached) => {
+    if (cached && conns.get(key) === conn && !conn.catalog) {
+      conn.catalog = cached;
+      log(`Schema cache hit for ${meta.name}: ${cached.tables.length} tables/views (refreshing in background)`);
+      catalogUpdated(conn);
+    }
+  });
+  void refreshCatalog(conn);
+  void loadDatabases(conn);
+  return conn;
+}
+
 async function connect(arg?: TreeArg): Promise<void> {
   const id = argId(arg);
   const meta = id ? store.get(id) : await pickConnection('Connect to…');
   if (!meta) return;
-  const secret = (await store.secret(meta.id)) ?? '';
   try {
-    const t0 = performance.now();
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: `Connecting to ${meta.name}…` },
       async () => {
-        // Lazy driver load happens inside openSession — first connect pays it, activation never does.
-        const { openSession } = await import('./drivers');
-        const next = await openSession(meta, secret);
-        await active?.dispose().catch(() => undefined);
-        active = next;
-        activeCatalog = undefined;
+        active = await openConn(meta);
       }
     );
-    log(`Connected to ${meta.name} (${kindLabel(meta.kind)}) in ${(performance.now() - t0).toFixed(0)} ms`);
     refreshUi();
     vscode.window.setStatusBarMessage(`$(check) Connected to ${meta.name}`, 3000);
-    const session = active;
-    if (session) {
-      // Instant completions from the disk cache, fresh catalog in the background.
-      void loadCachedCatalog(ctx, catalogCacheKey(meta.id, meta.database)).then((cached) => {
-        if (cached && active === session && !activeCatalog) {
-          activeCatalog = cached;
-          log(`Schema cache hit for ${meta.name}: ${cached.tables.length} tables/views (refreshing in background)`);
-          catalogUpdated();
-        }
-      });
-      void refreshCatalog(session);
-    }
   } catch (e) {
     log(`Connect failed for ${meta.name}: ${(e as Error)?.message ?? e}`);
     vscode.window.showErrorMessage(
@@ -315,29 +400,58 @@ async function connect(arg?: TreeArg): Promise<void> {
 }
 
 /** Everything that consumes the catalog gets notified about a new one. */
-function catalogUpdated(): void {
-  const cat = activeCatalog;
+function catalogUpdated(conn: Conn): void {
+  const cat = conn.catalog;
   if (cat) {
     // Prebuild completion items off the keystroke path.
     setTimeout(() => completionApi.prewarm(cat), 0);
   }
   semanticApi.refresh();
   treeChanged.fire();
-  QueryBuilderPanel.postCatalog(activeCatalog, active?.meta);
+  if (conn === active) QueryBuilderPanel.postCatalog(conn.catalog, conn.session.meta);
 }
 
-async function refreshCatalog(session: DbSession): Promise<void> {
+/**
+ * Populate the database level of the tree: the database we're attached to plus
+ * every other database on the server (fields-mode connections can switch).
+ * Best-effort — missing permissions leave just the current database.
+ */
+async function loadDatabases(conn: Conn): Promise<void> {
+  const session = conn.session;
+  try {
+    const cur = await scalar(session, currentDatabaseSql(session.meta.kind));
+    conn.currentDb = cur != null ? String(cur) : session.meta.database;
+  } catch {
+    conn.currentDb = session.meta.database;
+  }
+  if (conns.get(conn.key) !== conn) return; // disconnected while loading
+  try {
+    if (session.meta.mode === 'fields') {
+      const res = await session.run(listDatabasesSql(session.meta.kind));
+      conn.databases = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
+    } else {
+      conn.databases = conn.currentDb ? [conn.currentDb] : [];
+    }
+  } catch {
+    conn.databases = conn.currentDb ? [conn.currentDb] : [];
+  }
+  log(`Databases on ${session.meta.name}: ${conn.databases.length || 1} (current: ${conn.currentDb ?? '?'})`);
+  refreshUi();
+}
+
+async function refreshCatalog(conn: Conn): Promise<void> {
   if (!vscode.workspace.getConfiguration('dbtool').get('schemaCompletion', true)) return;
   const t0 = performance.now();
+  const session = conn.session;
   try {
     const cat = await loadCatalog(session);
-    if (active !== session) return; // switched away while loading
-    activeCatalog = cat;
+    if (conns.get(conn.key) !== conn) return; // disconnected while loading
+    conn.catalog = cat;
     log(
       `Schema loaded for ${session.meta.name}: ${cat.tables.length} tables/views, ` +
       `${cat.fks.length} foreign keys, ${cat.routines.length} routines in ${(performance.now() - t0).toFixed(0)} ms`
     );
-    catalogUpdated();
+    catalogUpdated(conn);
     void saveCatalogCache(ctx, catalogCacheKey(session.meta.id, session.meta.database), cat);
   } catch (e) {
     log(`Schema load failed for ${session.meta.name}: ${(e as Error)?.message ?? e}`);
@@ -345,33 +459,36 @@ async function refreshCatalog(session: DbSession): Promise<void> {
 }
 
 async function refreshSchema(): Promise<void> {
-  if (!active) {
+  const conn = active;
+  if (!conn) {
     vscode.window.showWarningMessage('DB Lite: connect to a database first.');
     return;
   }
-  const session = active;
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Window, title: `Refreshing schema of ${session.meta.name}…` },
-    () => refreshCatalog(session)
+    { location: vscode.ProgressLocation.Window, title: `Refreshing schema of ${conn.session.meta.name}…` },
+    () => refreshCatalog(conn)
   );
-  if (activeCatalog && active === session) {
+  if (conn.catalog && active === conn) {
     vscode.window.setStatusBarMessage(
-      `$(check) Schema refreshed — ${activeCatalog.tables.length} tables/views`,
+      `$(check) Schema refreshed — ${conn.catalog.tables.length} tables/views`,
       3000
     );
   }
 }
 
+/** Close every open session (all connections, all tabs). */
 async function disconnect(): Promise<void> {
-  if (!active) return;
-  const name = active.meta.name;
-  await active.dispose().catch(() => undefined);
+  if (conns.size === 0) return;
+  const names = [...new Set([...conns.values()].map((c) => c.session.meta.name))].join(', ');
+  const open = [...conns.values()];
+  conns.clear();
+  tabConns.clear();
   active = undefined;
-  activeCatalog = undefined;
-  log(`Disconnected from ${name}`);
+  await Promise.all(open.map((c) => c.session.dispose().catch(() => undefined)));
+  log(`Disconnected from ${names}`);
   refreshUi();
   QueryBuilderPanel.postCatalog(undefined, undefined);
-  vscode.window.setStatusBarMessage(`Disconnected from ${name}`, 3000);
+  vscode.window.setStatusBarMessage(`Disconnected from ${names}`, 3000);
 }
 
 async function editConnection(arg?: TreeArg): Promise<void> {
@@ -391,10 +508,16 @@ async function removeConnection(arg?: TreeArg): Promise<void> {
     'Delete'
   );
   if (ok !== 'Delete') return;
-  if (active?.meta.id === meta.id) await disconnect();
+  for (const [key, conn] of [...conns]) {
+    if (conn.session.meta.id !== meta.id) continue;
+    conns.delete(key);
+    for (const [uri, c] of [...tabConns]) if (c === conn) tabConns.delete(uri);
+    if (active === conn) active = undefined;
+    void conn.session.dispose().catch(() => undefined);
+  }
   await store.remove(meta.id);
   await deleteCatalogCache(ctx, meta.id);
-  treeChanged.fire();
+  refreshUi();
 }
 
 async function clearAllData(): Promise<void> {
@@ -415,19 +538,68 @@ async function clearAllData(): Promise<void> {
 
 // -------------------------------------------------------------------- queries
 
-async function newQuery(): Promise<void> {
-  const doc = await vscode.workspace.openTextDocument({
-    language: 'sql',
-    content: '',
-  });
+/** New SQL tab. From a connection's context menu it is bound to that connection right away. */
+async function newQuery(arg?: TreeArg): Promise<void> {
+  const id = argId(arg);
+  let conn = active;
+  const meta = id ? store.get(id) : undefined;
+  if (meta && meta.id !== active?.session.meta.id) {
+    try {
+      conn = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: `Connecting to ${meta.name}…` },
+        () => openConn(meta)
+      );
+    } catch (e) {
+      vscode.window.showErrorMessage(`DB Lite: failed to connect to "${meta.name}" — ${(e as Error)?.message ?? e}`);
+      return;
+    }
+  }
+  const doc = await vscode.workspace.openTextDocument({ language: 'sql', content: '' });
+  if (conn) tabConns.set(doc.uri.toString(), conn);
   await vscode.window.showTextDocument(doc);
+  connectionBar.refresh();
 }
 
-async function ensureSession(): Promise<DbSession | undefined> {
+/** Bar click / command: bind the current SQL tab to a (possibly different) connection. */
+async function pickTabConnection(uri?: vscode.Uri): Promise<void> {
+  const doc =
+    (uri && vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString())) ??
+    vscode.window.activeTextEditor?.document;
+  if (!doc) return;
+  const meta = await pickConnection('Use connection for this tab…');
+  if (!meta) return;
+  try {
+    const conn = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: `Connecting to ${meta.name}…` },
+      () => openConn(meta)
+    );
+    tabConns.set(doc.uri.toString(), conn);
+    active ??= conn; // first connection also becomes the explorer's current one
+    log(`Tab ${doc.uri.toString()} bound to ${meta.name}`);
+    refreshUi();
+  } catch (e) {
+    vscode.window.showErrorMessage(`DB Lite: failed to connect to "${meta.name}" — ${(e as Error)?.message ?? e}`);
+  }
+}
+
+async function ensureActive(): Promise<Conn | undefined> {
   if (!active) {
     await connect();
   }
   return active;
+}
+
+/** The connection a query in `doc` should run on — binds unbound tabs to the active one. */
+async function connForDoc(doc: vscode.TextDocument): Promise<Conn | undefined> {
+  const key = doc.uri.toString();
+  const bound = tabConns.get(key);
+  if (bound) return bound;
+  const conn = await ensureActive();
+  if (conn) {
+    tabConns.set(key, conn);
+    connectionBar.refresh();
+  }
+  return conn;
 }
 
 function editorSql(): string | undefined {
@@ -451,13 +623,36 @@ function editorSql(): string | undefined {
 }
 
 async function runQuery(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
   const sql = editorSql();
-  if (!sql) return;
-  await runSqlText(sql);
+  if (!sql || !editor) return;
+  const conn = await connForDoc(editor.document);
+  if (!conn) return;
+  await runSqlText(sql, conn);
 }
 
-async function runSqlText(sql: string): Promise<void> {
-  const session = await ensureSession();
+/** Where results render: SSMS-style grid in the bottom panel, terminal text, or an editor tab. */
+function resultsLocation(): 'panel' | 'terminal' | 'grid' {
+  const v = vscode.workspace.getConfiguration('dbtool').get<string>('resultsLocation', 'panel');
+  return v === 'terminal' || v === 'grid' ? v : 'panel';
+}
+
+function showResults(meta: ConnectionMeta, outcome: QueryOutcome, maxRows: number): void {
+  const loc = resultsLocation();
+  if (loc === 'terminal') ResultsTerminal.showResults(meta, outcome, maxRows);
+  else if (loc === 'grid') ResultsPanel.showResults(meta, outcome, maxRows);
+  else ResultsView.showResults(meta, outcome, maxRows);
+}
+
+function showResultsError(meta: ConnectionMeta, error: unknown): void {
+  const loc = resultsLocation();
+  if (loc === 'terminal') ResultsTerminal.showError(meta, error);
+  else if (loc === 'grid') ResultsPanel.showError(meta, error);
+  else ResultsView.showError(meta, error);
+}
+
+async function runSqlText(sql: string, conn?: Conn): Promise<void> {
+  const session = (conn ?? (await ensureActive()))?.session;
   if (!session) return;
   const maxRows = vscode.workspace.getConfiguration('dbtool').get<number>('maxRenderRows', 1000);
   const stop = startTimer(`running on ${session.meta.name}`);
@@ -468,10 +663,10 @@ async function runSqlText(sql: string): Promise<void> {
       `Query on ${session.meta.name} ok in ${outcome.durationMs.toFixed(1)} ms — ` +
       `${outcome.sets.length} set(s), ${rows} row(s): ${sqlPreview(sql)}`
     );
-    ResultsPanel.showResults(session.meta, outcome, maxRows);
+    showResults(session.meta, outcome, maxRows);
   } catch (e) {
     log(`Query on ${session.meta.name} FAILED: ${(e as Error)?.message ?? e} — ${sqlPreview(sql)}`);
-    ResultsPanel.showError(session.meta, e);
+    showResultsError(session.meta, e);
   } finally {
     stop();
   }
@@ -479,9 +674,10 @@ async function runSqlText(sql: string): Promise<void> {
 
 /** Run with actual execution plan: EXPLAIN ANALYZE (pg) / STATISTICS XML (mssql). */
 async function explainQuery(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
   const sql = editorSql();
-  if (!sql) return;
-  const session = await ensureSession();
+  if (!sql || !editor) return;
+  const session = (await connForDoc(editor.document))?.session;
   if (!session) return;
   const maxRows = vscode.workspace.getConfiguration('dbtool').get<number>('maxRenderRows', 1000);
   const stop = startTimer(`plan on ${session.meta.name}`);
@@ -528,14 +724,14 @@ function nodeRoutine(n?: TreeNode): CatalogRoutine | undefined {
 
 async function peekTable(n?: TreeNode, table?: CatalogTable): Promise<void> {
   const t = table ?? nodeTable(n);
-  const session = active;
-  if (!t || !session) return;
-  await runSqlText(peekSql(t, session.meta.kind, 100));
+  const conn = active;
+  if (!t || !conn) return;
+  await runSqlText(peekSql(t, conn.session.meta.kind, 100), conn);
 }
 
 async function viewRoutine(n?: TreeNode, routine?: CatalogRoutine): Promise<void> {
   const r = routine ?? nodeRoutine(n);
-  const session = active;
+  const session = active?.session;
   if (!r || !session) return;
   const stop = startTimer(`loading ${r.name}`);
   try {
@@ -547,8 +743,7 @@ async function viewRoutine(n?: TreeNode, routine?: CatalogRoutine): Promise<void
     const content = defs.length
       ? defs.join('\n\nGO\n\n')
       : `-- No definition available for ${r.schema}.${r.name} (missing permissions?)`;
-    const doc = await vscode.workspace.openTextDocument({ language: 'sql', content });
-    await vscode.window.showTextDocument(doc);
+    await openSqlEditor(content);
   } catch (e) {
     vscode.window.showErrorMessage(`DB Lite: failed to load definition — ${(e as Error)?.message ?? e}`);
   } finally {
@@ -558,18 +753,14 @@ async function viewRoutine(n?: TreeNode, routine?: CatalogRoutine): Promise<void
 
 async function execRoutine(n?: TreeNode, routine?: CatalogRoutine): Promise<void> {
   const r = routine ?? nodeRoutine(n);
-  const session = active;
+  const session = active?.session;
   if (!r || !session) return;
-  const doc = await vscode.workspace.openTextDocument({
-    language: 'sql',
-    content: execTemplate(r, session.meta.kind) + '\n',
-  });
-  await vscode.window.showTextDocument(doc);
+  await openSqlEditor(execTemplate(r, session.meta.kind) + '\n');
 }
 
 /** Fuzzy quick-pick over every table / view / procedure / function. */
 async function searchObjects(): Promise<void> {
-  const cat = activeCatalog;
+  const cat = active?.catalog;
   if (!cat) {
     vscode.window.showWarningMessage('DB Lite: connect first — the schema loads right after connecting.');
     return;
@@ -599,21 +790,24 @@ async function searchObjects(): Promise<void> {
 }
 
 function openQueryBuilder(): void {
-  QueryBuilderPanel.open(ctx, () => activeCatalog, () => active?.meta, (sql) => void runSqlText(sql));
+  QueryBuilderPanel.open(ctx, () => active?.catalog, () => active?.session.meta, (sql) => void runSqlText(sql));
 }
 
 // ------------------------------------------------------- object management
 
+/** Open a generated SQL script in a new tab, bound to the active connection. */
 async function openSqlEditor(content: string): Promise<void> {
   const doc = await vscode.workspace.openTextDocument({ language: 'sql', content });
+  if (active) tabConns.set(doc.uri.toString(), active);
   await vscode.window.showTextDocument(doc);
+  connectionBar.refresh();
 }
 
 /** Resolve a table from a tree node, or let the user pick one. */
 async function resolveTable(n?: TreeNode): Promise<CatalogTable | undefined> {
   const fromNode = nodeTable(n);
   if (fromNode) return fromNode;
-  const cat = activeCatalog;
+  const cat = active?.catalog;
   if (!cat) {
     vscode.window.showWarningMessage('DB Lite: connect first — the schema loads right after connecting.');
     return undefined;
@@ -633,7 +827,7 @@ async function resolveTable(n?: TreeNode): Promise<CatalogTable | undefined> {
 async function resolveRoutine(n?: TreeNode): Promise<CatalogRoutine | undefined> {
   const fromNode = nodeRoutine(n);
   if (fromNode) return fromNode;
-  const cat = activeCatalog;
+  const cat = active?.catalog;
   if (!cat) return undefined;
   type Item = vscode.QuickPickItem & { routine: CatalogRoutine };
   const picked = await vscode.window.showQuickPick<Item>(
@@ -665,7 +859,8 @@ async function runDdl(session: DbSession, sql: string, successMsg: string): Prom
     await session.run(sql);
     log(`DDL on ${session.meta.name}: ${sqlPreview(sql)}`);
     vscode.window.setStatusBarMessage(`$(check) ${successMsg}`, 5000);
-    if (active === session) void refreshCatalog(session);
+    const conn = [...conns.values()].find((c) => c.session === session);
+    if (conn) void refreshCatalog(conn);
     return true;
   } catch (e) {
     log(`DDL on ${session.meta.name} FAILED: ${(e as Error)?.message ?? e} — ${sqlPreview(sql)}`);
@@ -683,7 +878,7 @@ async function scalar(session: DbSession, sql: string): Promise<unknown> {
 
 async function countRows(n?: TreeNode): Promise<void> {
   const t = await resolveTable(n);
-  const session = active;
+  const session = active?.session;
   if (!t || !session) return;
   const stop = startTimer(`counting ${t.name}`);
   try {
@@ -702,8 +897,8 @@ async function scriptTable(
   mode: 'select' | 'insert' | 'update' | 'delete' | 'create'
 ): Promise<void> {
   const t = await resolveTable(n);
-  const session = active;
-  const cat = activeCatalog;
+  const session = active?.session;
+  const cat = active?.catalog;
   if (!t || !session || !cat) return;
   const kind = session.meta.kind;
   if (mode === 'create' && t.isView) {
@@ -732,7 +927,7 @@ async function scriptTable(
 
 async function truncateTable(n?: TreeNode): Promise<void> {
   const t = await resolveTable(n);
-  const session = active;
+  const session = active?.session;
   if (!t || !session) return;
   if (t.isView) {
     vscode.window.showWarningMessage('DB Lite: views cannot be truncated.');
@@ -752,7 +947,7 @@ async function truncateTable(n?: TreeNode): Promise<void> {
 
 async function deleteAllRows(n?: TreeNode): Promise<void> {
   const t = await resolveTable(n);
-  const session = active;
+  const session = active?.session;
   if (!t || !session) return;
   const count = await rowCountSafe(session, t);
   const ok = await confirmDestructive(
@@ -766,7 +961,7 @@ async function deleteAllRows(n?: TreeNode): Promise<void> {
 
 async function dropObject(n?: TreeNode): Promise<void> {
   const t = await resolveTable(n);
-  const session = active;
+  const session = active?.session;
   if (!t || !session) return;
   const label = t.isView ? 'view' : 'table';
   const ok = await confirmDestructive(
@@ -780,7 +975,7 @@ async function dropObject(n?: TreeNode): Promise<void> {
 
 async function dropRoutine(n?: TreeNode): Promise<void> {
   const r = await resolveRoutine(n);
-  const session = active;
+  const session = active?.session;
   if (!r || !session) return;
   const ok = await confirmDestructive(
     `Drop ${r.kind} ${r.schema}.${r.name}?`,
@@ -803,7 +998,7 @@ async function rowCountSafe(session: DbSession, t: CatalogTable): Promise<string
 // ------------------------------------------------------- create / databases
 
 async function createObject(): Promise<void> {
-  const kind = active?.meta.kind ?? 'postgres';
+  const kind = active?.session.meta.kind ?? 'postgres';
   type Item = vscode.QuickPickItem & { make?: (k: DbKind) => string; db?: boolean };
   const items: Item[] = [
     { label: '$(table) Table', description: 'CREATE TABLE script', make: newTableTemplate },
@@ -827,7 +1022,7 @@ async function createObject(): Promise<void> {
 }
 
 async function createDatabase(): Promise<void> {
-  const session = await ensureSession();
+  const session = (await ensureActive())?.session;
   if (!session) return;
   const name = await vscode.window.showInputBox({
     prompt: `New database name on "${session.meta.name}" (${kindLabel(session.meta.kind)})`,
@@ -849,44 +1044,49 @@ async function createDatabase(): Promise<void> {
   await runDdl(session, createDatabaseSql(name, session.meta.kind), `Created database ${name}`);
 }
 
-/** Reconnect the current fields-mode connection against another database. */
-async function switchDatabase(): Promise<void> {
-  const session = await ensureSession();
-  if (!session) return;
+/** Attach the explorer to another database of the current fields-mode connection. */
+async function switchDatabase(n?: TreeNode): Promise<void> {
+  const conn = await ensureActive();
+  const session = conn?.session;
+  if (!conn || !session) return;
   if (session.meta.mode === 'string') {
     vscode.window.showWarningMessage(
       'DB Lite: switching databases is only supported for host/user connections — edit the connection string instead.'
     );
     return;
   }
-  let names: string[];
-  try {
-    const res = await session.run(listDatabasesSql(session.meta.kind));
-    names = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
-  } catch (e) {
-    vscode.window.showErrorMessage(`DB Lite: could not list databases — ${(e as Error)?.message ?? e}`);
-    return;
+  const attached = conn.currentDb ?? session.meta.database;
+  // Clicked straight on a database node in the tree — no picker needed.
+  let target = n && typeof n === 'object' && 't' in n && n.t === 'db' ? n.name : undefined;
+  if (!target) {
+    let names: string[];
+    try {
+      const res = await session.run(listDatabasesSql(session.meta.kind));
+      names = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
+    } catch (e) {
+      vscode.window.showErrorMessage(`DB Lite: could not list databases — ${(e as Error)?.message ?? e}`);
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      names.map((name) => ({
+        label: `$(database) ${name}`,
+        description: name === attached ? 'current' : undefined,
+        name,
+      })),
+      { placeHolder: `Switch database on ${session.meta.name}…` }
+    );
+    target = picked?.name;
   }
-  const picked = await vscode.window.showQuickPick(
-    names.map((n) => ({
-      label: `$(database) ${n}`,
-      description: n === session.meta.database ? 'current' : undefined,
-      name: n,
-    })),
-    { placeHolder: `Switch database on ${session.meta.name}…` }
-  );
-  if (!picked || picked.name === session.meta.database) return;
-  const secret = (await store.secret(session.meta.id)) ?? '';
-  const meta: ConnectionMeta = { ...session.meta, database: picked.name };
+  if (!target || target === attached) return;
+  const meta: ConnectionMeta = { ...session.meta, database: target };
   try {
-    const { openSession } = await import('./drivers');
-    const next = await openSession(meta, secret);
-    await active?.dispose().catch(() => undefined);
-    active = next;
-    activeCatalog = undefined;
-    log(`Switched to database ${picked.name} on ${meta.name}`);
+    // A separate pooled session per database — tabs bound to the old one keep working.
+    active = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: `Switching to ${target}…` },
+      () => openConn(meta)
+    );
+    log(`Switched to database ${target} on ${meta.name}`);
     refreshUi();
-    void refreshCatalog(next);
   } catch (e) {
     vscode.window.showErrorMessage(`DB Lite: failed to switch database — ${(e as Error)?.message ?? e}`);
   }

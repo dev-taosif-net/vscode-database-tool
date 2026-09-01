@@ -41,7 +41,7 @@ export class ResultsPanel {
   static showResults(meta: ConnectionMeta, outcome: QueryOutcome, maxRows: number): void {
     const p = this.ensure(meta);
     p.title = `Results — ${meta.name}`;
-    p.webview.html = page(renderOutcome(meta, outcome, maxRows), meta);
+    p.webview.html = renderResultsHtml(meta, outcome, maxRows);
   }
 
   /** Execution plan view: plan tree(s) + any data result sets underneath. */
@@ -64,21 +64,30 @@ export class ResultsPanel {
   static showError(meta: ConnectionMeta, error: unknown): void {
     const p = this.ensure(meta);
     p.title = `Error — ${meta.name}`;
-    const e = error as { message?: string; lineNumber?: number; position?: string; code?: string };
-    const detail = [
-      e?.code ? `Code: ${e.code}` : '',
-      e?.lineNumber ? `Line: ${e.lineNumber}` : '',
-      e?.position ? `Position: ${e.position}` : '',
-    ]
-      .filter(Boolean)
-      .join(' · ');
-    p.webview.html = page(
-      `${banner(meta)}<div class="error"><div class="error-title">Query failed</div><pre>${esc(
-        String(e?.message ?? error)
-      )}</pre>${detail ? `<div class="dim">${esc(detail)}</div>` : ''}</div>`,
-      meta
-    );
+    p.webview.html = renderErrorHtml(meta, error);
   }
+}
+
+/** Full results page (summary + grids) — shared by the editor tab and the bottom panel view. */
+export function renderResultsHtml(meta: ConnectionMeta, outcome: QueryOutcome, maxRows: number): string {
+  return page(renderOutcome(meta, outcome, maxRows), meta);
+}
+
+export function renderErrorHtml(meta: ConnectionMeta, error: unknown): string {
+  const e = error as { message?: string; lineNumber?: number; position?: string; code?: string };
+  const detail = [
+    e?.code ? `Code: ${e.code}` : '',
+    e?.lineNumber ? `Line: ${e.lineNumber}` : '',
+    e?.position ? `Position: ${e.position}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  return page(
+    `${banner(meta)}<div class="error"><div class="error-title">Query failed</div><pre>${esc(
+      String(e?.message ?? error)
+    )}</pre>${detail ? `<div class="dim">${esc(detail)}</div>` : ''}</div>`,
+    meta
+  );
 }
 
 function banner(meta: ConnectionMeta): string {
@@ -122,8 +131,9 @@ function renderSet(set: ResultSet, maxRows: number): string {
   return `${note}<div class="scroll"><table><thead><tr><th class="n">#</th>${head}</tr></thead><tbody>${body}</tbody></table></div>${truncated}`;
 }
 
-function cell(v: unknown): string {
-  if (v === null || v === undefined) return '<td class="null">NULL</td>';
+/** Plain-text form of a cell value (dates, buffers, JSON …), truncated for display. */
+export function displayText(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL';
   let text: string;
   if (v instanceof Date) {
     text = isNaN(v.getTime()) ? 'invalid date' : v.toISOString().replace('T', ' ').replace('.000Z', '').replace('Z', '');
@@ -139,7 +149,12 @@ function cell(v: unknown): string {
   } else {
     text = String(v);
   }
-  if (text.length > 2000) text = text.slice(0, 2000) + '…';
+  return text.length > 2000 ? text.slice(0, 2000) + '…' : text;
+}
+
+function cell(v: unknown): string {
+  if (v === null || v === undefined) return '<td class="null">NULL</td>';
+  const text = displayText(v);
   const cls = typeof v === 'number' || typeof v === 'bigint' ? ' class="num"' : '';
   return `<td${cls} title="${esc(text)}">${esc(text)}</td>`;
 }
@@ -170,7 +185,7 @@ function page(body: string, meta: ConnectionMeta): string {
   td.n, th.n { opacity: .45; text-align: right; user-select: none; cursor: pointer; }
   tr:hover td { background: var(--hover); }
   td.sel { background: var(--accent) !important; color: var(--accent-fg) !important; }
-  .null { opacity: .5; font-style: italic; }
+  td.null { background: var(--null-bg); color: var(--null-fg); font-style: italic; }
   .dim { opacity: .6; }
   .error { border-left: 3px solid var(--error); padding: 6px 10px; margin-top: 10px; }
   .error-title { color: var(--error); font-weight: 600; margin-bottom: 6px; }

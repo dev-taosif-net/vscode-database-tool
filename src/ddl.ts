@@ -253,6 +253,11 @@ export function listDatabasesSql(kind: DbKind): string {
     : 'SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn ORDER BY datname';
 }
 
+/** Name of the database the session is currently attached to (one scalar). */
+export function currentDatabaseSql(kind: DbKind): string {
+  return kind === 'mssql' ? 'SELECT DB_NAME()' : 'SELECT current_database()';
+}
+
 /** View source: postgres needs the body wrapped; mssql returns full DDL. */
 export function viewDefinitionSql(t: CatalogTable, kind: DbKind): string {
   if (kind === 'postgres') {

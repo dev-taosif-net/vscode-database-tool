@@ -23,6 +23,8 @@ import {
 
 /** ... FROM | / JOIN | / INSERT INTO | / UPDATE |  → table names. */
 const TABLE_KEYWORD_TAIL = /\b(from|join|into|update)\s+$/i;
+/** A (partial, possibly schema-qualified) table name being typed after FROM/JOIN → alias contexts. */
+const TABLE_NAME_TAIL = /\b(from|join)\s+[\w$."'`[\]]*$/i;
 /** ... JOIN tbl [AS alias] ON |  → generated FK condition. */
 const ON_TAIL = new RegExp(String.raw`\bjoin\s+(${QUALIFIED})(?:\s+(?:as\s+)?([A-Za-z_]\w*))?\s+on\s+$`, 'i');
 /** ... JOIN tbl [AS alias] |  → "ON a.col = b.col" suggestion. */
@@ -31,8 +33,17 @@ const JOINED_TABLE_TAIL = new RegExp(String.raw`\bjoin\s+(${QUALIFIED})(?:\s+(?:
 const DOT_TAIL = new RegExp(`(${QUALIFIED})\\.$`);
 /** EXEC / EXECUTE / CALL followed by a (partial) routine name → procedures. */
 const EXEC_TAIL = /\b(exec(?:ute)?|call)\s+[\w$.[\]"]*$/i;
+/** USE followed by a (partial) name → database names. */
+const USE_TAIL = /\buse\s+[\w$[\]"]*$/i;
 /** Only the statement's first word typed so far → statement snippets apply. */
 const STMT_START = /^\s*[A-Za-z_]*$/;
+
+export interface DatabaseInfo {
+  /** every database on the server (may be just the current one) */
+  names: string[];
+  /** database the active session is attached to */
+  current?: string;
+}
 
 export interface CompletionApi {
   /** Prebuild all catalog-derived items so the first keystroke has zero lag. */
@@ -42,14 +53,17 @@ export interface CompletionApi {
 export function registerCompletions(
   ctx: vscode.ExtensionContext,
   activeKind: () => DbKind | undefined,
-  activeCatalog: () => Catalog | undefined
+  activeCatalog: () => Catalog | undefined,
+  activeDatabases: () => DatabaseInfo
 ): CompletionApi {
   const staticCache = new Map<string, vscode.CompletionItem[]>();
   const snippetCache = new Map<string, vscode.CompletionItem[]>();
   const tableItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
+  const tableAliasItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
   const columnItemCache = new WeakMap<CatalogTable, vscode.CompletionItem[]>();
   const routineItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
   const execItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
+  const schemaItemCache = new WeakMap<Catalog, vscode.CompletionItem[]>();
 
   const columnItems = (cat: Catalog, t: CatalogTable): vscode.CompletionItem[] => {
     let items = columnItemCache.get(t);
@@ -70,11 +84,26 @@ export function registerCompletions(
   };
 
   const tableItems = (cat: Catalog, schema?: string): vscode.CompletionItem[] => {
-    if (schema) return cat.tablesInSchema(schema).map((t) => tableItem(cat, t));
+    // After `schema.` the schema is already typed — insert the bare name only.
+    if (schema) return cat.tablesInSchema(schema).map((t) => tableItem(cat, t, true));
     let items = tableItemCache.get(cat);
     if (!items) {
       items = cat.tables.map((t) => tableItem(cat, t));
       tableItemCache.set(cat, items);
+    }
+    return items;
+  };
+
+  /** Table items that also insert the first alias (FROM/JOIN contexts): `saas.empInfo eebi`. */
+  const tableItemsAliased = (cat: Catalog, schema?: string): vscode.CompletionItem[] => {
+    if (!vscode.workspace.getConfiguration('dbtool').get('autoAlias', true)) {
+      return tableItems(cat, schema);
+    }
+    if (schema) return cat.tablesInSchema(schema).map((t) => tableItem(cat, t, true, true));
+    let items = tableAliasItemCache.get(cat);
+    if (!items) {
+      items = cat.tables.map((t) => tableItem(cat, t, false, true));
+      tableAliasItemCache.set(cat, items);
     }
     return items;
   };
@@ -97,16 +126,55 @@ export function registerCompletions(
     return items;
   };
 
+  const schemaItems = (cat: Catalog): vscode.CompletionItem[] => {
+    let items = schemaItemCache.get(cat);
+    if (!items) {
+      items = cat.schemaNames.map((s) => {
+        const item = new vscode.CompletionItem(
+          { label: s, description: 'schema' },
+          vscode.CompletionItemKind.Module
+        );
+        item.detail = 'schema';
+        item.insertText = quoteName(s, cat.kind);
+        item.sortText = '06' + s.toLowerCase();
+        return item;
+      });
+      schemaItemCache.set(cat, items);
+    }
+    return items;
+  };
+
+  const databaseItems = (dbs: DatabaseInfo, kind: DbKind | undefined): vscode.CompletionItem[] =>
+    dbs.names.map((name) => {
+      const isCurrent = name === dbs.current;
+      const item = new vscode.CompletionItem(
+        { label: name, description: isCurrent ? 'database · current' : 'database' },
+        vscode.CompletionItemKind.Folder
+      );
+      item.detail = 'database';
+      item.insertText = quoteName(name, kind ?? 'postgres');
+      item.sortText = (isCurrent ? '07' : '09') + name.toLowerCase();
+      return item;
+    });
+
   const provider: vscode.CompletionItemProvider = {
     provideCompletionItems(document, position, _token, context) {
       const cat = activeCatalog();
       const stmt = statementAt(document, position);
       const byTrigger = context.triggerKind === vscode.CompletionTriggerKind.TriggerCharacter;
+      // A table name being typed after FROM/JOIN → completions carry the alias along.
+      const wantAlias = TABLE_NAME_TAIL.test(stmt.before);
+      const tablesFn = wantAlias ? tableItemsAliased : tableItems;
 
-      // `alias.` / `table.` / `schema.` — only schema-aware items make sense.
+      // `alias.` / `table.` / `schema.` / `database.` — only schema-aware items make sense.
       if (byTrigger && context.triggerCharacter === '.') {
         if (!cat) return [];
-        return dotItems(stmt, cat, columnItems, tableItems);
+        return dotItems(stmt, cat, columnItems, tablesFn, schemaItems, activeDatabases());
+      }
+
+      // USE — database names on this server.
+      if (USE_TAIL.test(stmt.before)) {
+        return databaseItems(activeDatabases(), activeKind());
       }
 
       // EXEC / CALL — stored procedures & functions, ready-to-fill templates.
@@ -116,7 +184,7 @@ export function registerCompletions(
 
       const refs = cat ? parseRefs(stmt.full, cat) : [];
       const ctxResult = cat
-        ? contextItems(stmt.before, refs, cat, tableItems)
+        ? contextItems(stmt.before, refs, cat, tableItems, tableItemsAliased, schemaItems)
         : { exclusive: false, items: [] as vscode.CompletionItem[] };
       if (ctxResult.exclusive) return ctxResult.items;
 
@@ -151,8 +219,9 @@ export function registerCompletions(
             items.push(...columnItems(cat, ref.table));
           }
         }
-        items.push(...tableItems(cat), ...routineItems(cat));
+        items.push(...tablesFn(cat), ...schemaItems(cat), ...routineItems(cat));
       }
+      items.push(...databaseItems(activeDatabases(), activeKind()));
       items.push(...statics);
       return items;
     },
@@ -165,6 +234,8 @@ export function registerCompletions(
   return {
     prewarm(cat: Catalog): void {
       tableItems(cat);
+      tableItemsAliased(cat);
+      schemaItems(cat);
       routineItems(cat);
       execItems(cat);
       for (const t of cat.tables) columnItems(cat, t);
@@ -214,12 +285,15 @@ function refPrefix(ref: TableRef): string {
 
 type TableItemsFn = (cat: Catalog, schema?: string) => vscode.CompletionItem[];
 type ColumnItemsFn = (cat: Catalog, t: CatalogTable) => vscode.CompletionItem[];
+type SchemaItemsFn = (cat: Catalog) => vscode.CompletionItem[];
 
 function contextItems(
   before: string,
   refs: TableRef[],
   cat: Catalog,
-  tableItems: TableItemsFn
+  tableItems: TableItemsFn,
+  tableItemsAliased: TableItemsFn,
+  schemaItems: SchemaItemsFn
 ): { exclusive: boolean; items: vscode.CompletionItem[] } {
   // `JOIN x [a] ON ` — offer the FK condition(s); checked first because the
   // looser JOINED_TABLE_TAIL would swallow the trailing ON as an alias.
@@ -231,12 +305,16 @@ function contextItems(
   }
 
   // `FROM ` / `JOIN ` / `INSERT INTO ` / `UPDATE ` — table names (plus, after
-  // JOIN, complete FK-generated join clauses ranked first).
+  // JOIN, complete FK-generated join clauses ranked first) and schema names
+  // to start a qualified `schema.table` reference.
   const kw = TABLE_KEYWORD_TAIL.exec(before);
   if (kw) {
+    const word = kw[1].toLowerCase();
     const items: vscode.CompletionItem[] = [];
-    if (kw[1].toLowerCase() === 'join') items.push(...smartJoinItems(refs, cat));
-    items.push(...tableItems(cat));
+    if (word === 'join') items.push(...smartJoinItems(refs, cat));
+    // FROM/JOIN take an alias along; INSERT INTO / UPDATE targets stay bare.
+    const tables = word === 'from' || word === 'join' ? tableItemsAliased : tableItems;
+    items.push(...tables(cat), ...schemaItems(cat));
     return { exclusive: true, items };
   }
 
@@ -327,7 +405,9 @@ function dotItems(
   stmt: StmtCtx,
   cat: Catalog,
   columnItems: ColumnItemsFn,
-  tableItems: TableItemsFn
+  tableItems: TableItemsFn,
+  schemaItems: SchemaItemsFn,
+  dbs: DatabaseInfo
 ): vscode.CompletionItem[] {
   const m = DOT_TAIL.exec(stmt.before);
   if (!m) return [];
@@ -344,12 +424,15 @@ function dotItems(
   if (table) return columnItems(cat, table);
   const last = bare.split('.').pop()!;
   if (cat.isSchema(last)) return tableItems(cat, last);
+  // `currentdb.` — schemas of the connected database (db.schema.table chains).
+  if (dbs.current && last.toLowerCase() === dbs.current.toLowerCase()) return schemaItems(cat);
   return [];
 }
 
 // ------------------------------------------------------------- item builders
 
-function tableItem(cat: Catalog, t: CatalogTable): vscode.CompletionItem {
+/** `bare` = schema already typed (after `schema.`); `withAlias` = append the first alias. */
+function tableItem(cat: Catalog, t: CatalogTable, bare = false, withAlias = false): vscode.CompletionItem {
   const nonDefault = t.schema.toLowerCase() !== cat.defaultSchema;
   const item = new vscode.CompletionItem(
     {
@@ -358,8 +441,23 @@ function tableItem(cat: Catalog, t: CatalogTable): vscode.CompletionItem {
     },
     t.isView ? vscode.CompletionItemKind.Interface : vscode.CompletionItemKind.Class
   );
-  item.insertText = qualify(t, cat);
-  item.detail = t.isView ? 'view' : 'table';
+  const name = bare ? quoteName(t.name, cat.kind) : qualify(t, cat);
+  const alias = withAlias ? aliasFor(t.name)[0] : undefined;
+  item.insertText = alias ? `${name} ${alias}` : name;
+  if (alias) item.filterText = t.name;
+  item.detail = `${t.isView ? 'view' : 'table'} — ${t.columns.length} columns`;
+  // Column list in the docs popup, so picking a table shows what's inside it.
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(`${t.schema}.${t.name}`, 'sql');
+  const shown = t.columns.slice(0, 30);
+  for (const c of shown) {
+    const pk = t.pk?.includes(c.name) ? ' *(PK)*' : '';
+    md.appendMarkdown(`- \`${c.name}\` — ${c.dataType}${pk}\n`);
+  }
+  if (t.columns.length > shown.length) {
+    md.appendMarkdown(`- … ${t.columns.length - shown.length} more columns\n`);
+  }
+  item.documentation = md;
   item.sortText = '05' + t.name.toLowerCase();
   return item;
 }

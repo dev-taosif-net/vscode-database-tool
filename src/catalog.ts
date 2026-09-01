@@ -65,6 +65,8 @@ const norm = (s: string): string => s.replace(/[[\]"`]/g, '').toLowerCase();
 export class Catalog {
   private readonly byName = new Map<string, CatalogTable[]>();
   private readonly schemaSet = new Set<string>();
+  /** normalized schema → display-cased name, first occurrence wins */
+  private readonly schemaDisplay = new Map<string, string>();
   private readonly fksByTable = new Map<CatalogTable, CatalogFk[]>();
   private readonly fkEnds = new Map<CatalogFk, { from?: CatalogTable; to?: CatalogTable }>();
   private readonly routineByName = new Map<string, CatalogRoutine[]>();
@@ -81,6 +83,7 @@ export class Catalog {
       if (list) list.push(r);
       else this.routineByName.set(key, [r]);
       this.schemaSet.add(r.schema.toLowerCase());
+      if (!this.schemaDisplay.has(norm(r.schema))) this.schemaDisplay.set(norm(r.schema), r.schema);
     }
     for (const t of tables) {
       const key = norm(t.name);
@@ -88,6 +91,7 @@ export class Catalog {
       if (list) list.push(t);
       else this.byName.set(key, [t]);
       this.schemaSet.add(norm(t.schema));
+      if (!this.schemaDisplay.has(norm(t.schema))) this.schemaDisplay.set(norm(t.schema), t.schema);
     }
     for (const fk of fks) {
       const from = this.resolve(`${fk.fromSchema}.${fk.fromTable}`);
@@ -104,6 +108,11 @@ export class Catalog {
 
   get defaultSchema(): string {
     return this.kind === 'postgres' ? 'public' : 'dbo';
+  }
+
+  /** All schema names in display casing, sorted. */
+  get schemaNames(): string[] {
+    return [...this.schemaDisplay.values()].sort((a, b) => a.localeCompare(b));
   }
 
   isSchema(name: string): boolean {
@@ -162,18 +171,18 @@ export class Catalog {
   }
 
   toJSON(): SerializedCatalog {
-    return { v: 3, kind: this.kind, tables: this.tables, fks: this.fks, routines: this.routines };
+    return { v: 4, kind: this.kind, tables: this.tables, fks: this.fks, routines: this.routines };
   }
 
   static fromJSON(data: unknown): Catalog | undefined {
     const d = data as SerializedCatalog | undefined;
-    if (!d || d.v !== 3 || !Array.isArray(d.tables) || !Array.isArray(d.fks)) return undefined;
+    if (!d || d.v !== 4 || !Array.isArray(d.tables) || !Array.isArray(d.fks)) return undefined;
     return new Catalog(d.kind, d.tables, d.fks, Array.isArray(d.routines) ? d.routines : []);
   }
 }
 
 export interface SerializedCatalog {
-  v: 3;
+  v: 4;
   kind: DbKind;
   tables: CatalogTable[];
   fks: CatalogFk[];

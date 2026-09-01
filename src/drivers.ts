@@ -103,19 +103,22 @@ async function openMssql(meta: ConnectionMeta, secret: string): Promise<DbSessio
       // Support classic T-SQL scripts: split on GO batch separators.
       const batches = sql.split(/^\s*GO\s*;?\s*$/gim).map((b) => b.trim()).filter(Boolean);
       for (const batch of batches.length ? batches : [sql]) {
-        const res = await pool.request().query(batch);
-        const recordsets = res.recordsets as unknown as import('mssql').IRecordSet<Record<string, unknown>>[];
+        const request = pool.request();
+        // Array rows preserve duplicate column names (keyed objects collapse
+        // them into one entry) — the catalog queries select several columns
+        // all literally named "name". Same reason pg uses rowMode: 'array'.
+        request.arrayRowMode = true;
+        const res = await request.query(batch);
+        const recordsets = res.recordsets as unknown as unknown[][][];
+        const columnMeta = (res as unknown as { columns?: { name: string }[][] }).columns ?? [];
         if (recordsets.length > 0) {
-          for (const rs of recordsets) {
-            const columns = Object.values(rs.columns)
-              .sort((a, b) => a.index - b.index)
-              .map((c) => c.name);
+          recordsets.forEach((rows, i) => {
             sets.push({
-              columns,
-              rows: rs.map((row) => columns.map((c) => row[c])),
-              rowCount: rs.length,
+              columns: (columnMeta[i] ?? []).map((c) => c.name),
+              rows,
+              rowCount: rows.length,
             });
-          }
+          });
         } else {
           const affected = (res.rowsAffected ?? []).reduce((a, b) => a + b, 0);
           sets.push({ columns: [], rows: [], rowCount: affected, note: 'rows affected' });

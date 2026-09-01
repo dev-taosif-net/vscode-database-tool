@@ -20,6 +20,43 @@ interface FormData {
 }
 
 /**
+ * Every supported engine in one data-driven list: the searchable type dropdown,
+ * default ports, logos and connection-string examples all render from here —
+ * adding a new database type in the future is one new entry.
+ */
+interface DbTypeDef {
+  kind: DbKind;
+  label: string;
+  port: number;
+  /** inline SVG badge shown beside the name (CSP allows no external images) */
+  logo: string;
+  csExample: string;
+}
+
+const logoBadge = (bg: string, text: string, size: number): string =>
+  `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">` +
+  `<rect width="20" height="20" rx="4" fill="${bg}"/>` +
+  `<text x="10" y="${size >= 9 ? 14 : 13.5}" text-anchor="middle" font-family="sans-serif" ` +
+  `font-size="${size}" font-weight="700" fill="#fff">${text}</text></svg>`;
+
+const DB_TYPES: DbTypeDef[] = [
+  {
+    kind: 'postgres',
+    label: 'PostgreSQL',
+    port: 5432,
+    logo: logoBadge('#336791', 'Pg', 9),
+    csExample: 'postgres://user:password@host:5432/dbname?sslmode=require',
+  },
+  {
+    kind: 'mssql',
+    label: 'Microsoft SQL Server',
+    port: 1433,
+    logo: logoBadge('#CC2927', 'SQL', 7),
+    csExample: 'Server=host,1433;Database=db;User Id=sa;Password=...;Encrypt=true;TrustServerCertificate=true',
+  },
+];
+
+/**
  * Add/Edit Connection opens as a proper editor tab (webview form) instead of
  * a chain of quick inputs. Saved secrets are NEVER sent into the webview —
  * an empty password field on edit means "keep the stored one".
@@ -94,7 +131,7 @@ export class ConnectionFormPanel {
     const meta: ConnectionMeta = {
       id: this.existing?.id ?? (require('crypto').randomUUID() as string),
       name: d.name.trim(),
-      kind: d.kind === 'mssql' ? 'mssql' : 'postgres',
+      kind: DB_TYPES.some((t) => t.kind === d.kind) ? d.kind : 'postgres',
       mode: d.mode === 'string' ? 'string' : 'fields',
       color: safeColor(d.color),
       timeoutSec,
@@ -183,6 +220,7 @@ function html(
     editing: !!existing,
   };
   const initJson = JSON.stringify(init).replace(/</g, '\\u003c');
+  const typesJson = JSON.stringify(DB_TYPES).replace(/</g, '\\u003c');
   const swatches = SWATCHES.map(
     ([hex, label]) =>
       `<button type="button" class="swatch" data-color="${hex}" title="${label}" style="background:${hex}"></button>`
@@ -222,6 +260,25 @@ button.secondary { background: var(--badge-bg); color: var(--badge-fg); }
 fieldset { border: 1px solid var(--border); border-radius: 3px; margin: 14px 0 0; padding: 8px 12px 12px; }
 legend { padding: 0 4px; opacity: .8; font-size: 12px; }
 .hidden { display: none; }
+/* -------- searchable database-type dropdown -------- */
+.dd { position: relative; }
+.dd-btn { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box;
+  padding: 5px 8px; font-size: 13px; text-align: left; cursor: pointer;
+  background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border); border-radius: 2px; }
+.dd-btn:focus { outline: 1px solid var(--accent); }
+.dd-caret { margin-left: auto; opacity: .7; font-size: 10px; }
+.dd-logo { display: inline-flex; width: 18px; height: 18px; flex: none; }
+.dd-logo svg { width: 18px; height: 18px; }
+.dd-panel { position: absolute; top: calc(100% + 2px); left: 0; right: 0; z-index: 10;
+  background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 2px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.3); }
+.dd-panel input { border: none; border-bottom: 1px solid var(--input-border); border-radius: 0; }
+.dd-panel input:focus { outline: none; }
+.dd-list { max-height: 220px; overflow-y: auto; }
+.dd-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; cursor: pointer; }
+.dd-item:hover, .dd-item.active { background: var(--accent); color: var(--accent-fg, #fff); }
+.dd-item.selected::after { content: '✓'; margin-left: auto; opacity: .9; }
+.dd-empty { padding: 8px; opacity: .6; font-size: 12px; }
 </style></head><body>
 <h1 id="title"></h1>
 <div class="hint">Fields marked <span class="req">*</span> are required.</div>
@@ -230,9 +287,14 @@ legend { padding: 0 4px; opacity: .8; font-size: 12px; }
 <input type="text" id="name" placeholder="e.g. prod-postgres, local-mssql">
 
 <label>Database type</label>
-<div class="radios">
-  <label><input type="radio" name="kind" value="postgres"> PostgreSQL</label>
-  <label><input type="radio" name="kind" value="mssql"> Microsoft SQL Server</label>
+<div class="dd" id="kindDd">
+  <button type="button" class="dd-btn" id="kindBtn" aria-haspopup="listbox" aria-expanded="false">
+    <span class="dd-logo" id="kindLogo"></span><span id="kindLabel"></span><span class="dd-caret">▾</span>
+  </button>
+  <div class="dd-panel hidden" id="kindPanel">
+    <input type="text" id="kindSearch" placeholder="Search database type…" autocomplete="off">
+    <div class="dd-list" id="kindList" role="listbox"></div>
+  </div>
 </div>
 
 <label>Environment color <span class="hint">(shown on the connection icon, tab icon & status bar — e.g. red = production)</span></label>
@@ -298,12 +360,8 @@ legend { padding: 0 4px; opacity: .8; font-size: 12px; }
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const init = ${initJson};
+const DB_TYPES = ${typesJson};
 const $ = (id) => document.getElementById(id);
-const DEFAULT_PORTS = { postgres: 5432, mssql: 1433 };
-const CS_PLACEHOLDER = {
-  postgres: 'postgres://user:password@host:5432/dbname?sslmode=require',
-  mssql: 'Server=host,1433;Database=db;User Id=sa;Password=...;Encrypt=true;TrustServerCertificate=true',
-};
 
 $('title').textContent = init.editing ? 'Edit Connection — ' + init.name : 'New Connection';
 $('name').value = init.name;
@@ -314,12 +372,85 @@ $('user').value = init.user;
 $('ssl').value = init.ssl;
 $('enc').value = init.enc;
 $('timeoutSec').value = init.timeoutSec;
-document.querySelector('input[name=kind][value=' + init.kind + ']').checked = true;
 document.querySelector('input[name=mode][value=' + init.mode + ']').checked = true;
 if (init.hasSecret) {
   $('password').placeholder = 'leave empty to keep the saved password';
   $('connString').placeholder = 'leave empty to keep the saved connection string';
 }
+
+// ------------------------------------------- searchable database-type dropdown
+let selectedKind = DB_TYPES.some((t) => t.kind === init.kind) ? init.kind : DB_TYPES[0].kind;
+const typeOf = (k) => DB_TYPES.find((t) => t.kind === k) || DB_TYPES[0];
+let activeIdx = -1;
+
+function paintKindButton() {
+  const t = typeOf(selectedKind);
+  $('kindLogo').innerHTML = t.logo;
+  $('kindLabel').textContent = t.label;
+}
+function visibleTypes() {
+  const q = $('kindSearch').value.trim().toLowerCase();
+  return DB_TYPES.filter((t) => !q || t.label.toLowerCase().includes(q) || t.kind.includes(q));
+}
+function renderKindList() {
+  const list = $('kindList');
+  list.innerHTML = '';
+  const types = visibleTypes();
+  activeIdx = Math.min(activeIdx, types.length - 1);
+  types.forEach((t, i) => {
+    const el = document.createElement('div');
+    el.className = 'dd-item' + (t.kind === selectedKind ? ' selected' : '') + (i === activeIdx ? ' active' : '');
+    el.setAttribute('role', 'option');
+    const logo = document.createElement('span');
+    logo.className = 'dd-logo';
+    logo.innerHTML = t.logo;
+    const label = document.createElement('span');
+    label.textContent = t.label;
+    el.append(logo, label);
+    el.addEventListener('click', () => chooseKind(t.kind));
+    list.appendChild(el);
+  });
+  if (!types.length) {
+    const el = document.createElement('div');
+    el.className = 'dd-empty';
+    el.textContent = 'No matching database type';
+    list.appendChild(el);
+  }
+}
+function openKindDd() {
+  $('kindPanel').classList.remove('hidden');
+  $('kindBtn').setAttribute('aria-expanded', 'true');
+  $('kindSearch').value = '';
+  activeIdx = -1;
+  renderKindList();
+  $('kindSearch').focus();
+}
+function closeKindDd() {
+  $('kindPanel').classList.add('hidden');
+  $('kindBtn').setAttribute('aria-expanded', 'false');
+}
+function chooseKind(k) {
+  selectedKind = k;
+  paintKindButton();
+  closeKindDd();
+  $('kindBtn').focus();
+  refresh();
+}
+$('kindBtn').addEventListener('click', () => {
+  $('kindPanel').classList.contains('hidden') ? openKindDd() : closeKindDd();
+});
+$('kindSearch').addEventListener('input', () => { activeIdx = -1; renderKindList(); });
+$('kindSearch').addEventListener('keydown', (e) => {
+  const types = visibleTypes();
+  if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, types.length - 1); renderKindList(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); renderKindList(); }
+  else if (e.key === 'Enter') { e.preventDefault(); const t = types[activeIdx] || types[0]; if (t) chooseKind(t.kind); }
+  else if (e.key === 'Escape') { closeKindDd(); $('kindBtn').focus(); }
+});
+document.addEventListener('mousedown', (e) => {
+  if (!$('kindDd').contains(e.target)) closeKindDd();
+});
+paintKindButton();
 
 let color = init.color || '';
 function paintSwatches() {
@@ -333,20 +464,22 @@ $('customColor').addEventListener('input', () => { color = $('customColor').valu
 $('noColor').addEventListener('click', () => { color = ''; paintSwatches(); });
 paintSwatches();
 
-function kind() { return document.querySelector('input[name=kind]:checked').value; }
+function kind() { return selectedKind; }
 function mode() { return document.querySelector('input[name=mode]:checked').value; }
 function refresh() {
-  const k = kind(), m = mode();
+  const k = kind(), m = mode(), t = typeOf(k);
   $('fieldsSection').classList.toggle('hidden', m !== 'fields');
   $('stringSection').classList.toggle('hidden', m !== 'string');
   $('pgOptions').classList.toggle('hidden', k !== 'postgres');
   $('msOptions').classList.toggle('hidden', k !== 'mssql');
-  $('connString').placeholder = init.hasSecret ? $('connString').placeholder : CS_PLACEHOLDER[k];
-  $('csHint').textContent = 'Example: ' + CS_PLACEHOLDER[k] + ' — stored in your OS keychain.';
-  const other = DEFAULT_PORTS[k === 'postgres' ? 'mssql' : 'postgres'];
-  if (!$('port').value || Number($('port').value) === other) $('port').value = DEFAULT_PORTS[k];
+  $('connString').placeholder = init.hasSecret ? $('connString').placeholder : t.csExample;
+  $('csHint').textContent = 'Example: ' + t.csExample + ' — stored in your OS keychain.';
+  // Untouched port (empty or another type's default) follows the selected type.
+  const cur = Number($('port').value);
+  const defaults = DB_TYPES.map((d) => d.port);
+  if (!cur || (defaults.includes(cur) && cur !== t.port)) $('port').value = t.port;
 }
-document.querySelectorAll('input[name=kind],input[name=mode]').forEach((r) => r.addEventListener('change', refresh));
+document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', refresh));
 refresh();
 
 $('showCs').addEventListener('change', () => { $('connString').type = $('showCs').checked ? 'text' : 'password'; });
