@@ -39,7 +39,7 @@ interface Conn {
   key: string;
   session: DbSession;
   catalog?: Catalog;
-  /** All databases on the server (fields-mode) and the one we're attached to. */
+  /** All databases on the server, and the one we're attached to. */
   databases: string[];
   currentDb?: string;
 }
@@ -58,6 +58,13 @@ const treeChanged = new vscode.EventEmitter<TreeNode | undefined | void>();
 
 function connKey(meta: ConnectionMeta): string {
   return `${meta.id}\0${meta.database ?? ''}`;
+}
+
+/** An open session for this connection id — the active one when it matches, else any. */
+function connFor(id: string): Conn | undefined {
+  if (active?.session.meta.id === id) return active;
+  for (const c of conns.values()) if (c.session.meta.id === id) return c;
+  return undefined;
 }
 
 /** The connection the active editor's tab is bound to, falling back to the shared active one. */
@@ -158,7 +165,7 @@ type TreeArg = string | { id?: string } | TreeNode | undefined;
 
 type TreeNode =
   | { t: 'conn'; meta: ConnectionMeta }
-  | { t: 'db'; name: string; current: boolean }
+  | { t: 'db'; name: string; current: boolean; conn: Conn }
   | { t: 'grp'; label: string; icon: string; children: TreeNode[] }
   | { t: 'table'; table: CatalogTable }
   | { t: 'col'; table: CatalogTable; col: CatalogColumn }
@@ -174,14 +181,16 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
         .map((meta): TreeNode => ({ t: 'conn', meta }));
     }
     if (el.t === 'conn') {
-      // connection → databases → tables / views / procedures / functions
-      if (active?.session.meta.id !== el.meta.id || !active.catalog) return [];
-      const cur = active.currentDb ?? active.session.meta.database ?? '';
-      const names = active.databases.length ? active.databases : [cur];
-      return names.map((name): TreeNode => ({ t: 'db', name, current: name === cur }));
+      // connection → databases → tables / views / procedures / functions.
+      // Every open connection lists its server's databases, catalog or not.
+      const conn = connFor(el.meta.id);
+      if (!conn) return [];
+      const cur = conn.currentDb ?? conn.session.meta.database ?? '';
+      const names = conn.databases.length ? conn.databases : [cur];
+      return names.map((name): TreeNode => ({ t: 'db', name, current: name === cur, conn }));
     }
     if (el.t === 'db') {
-      return el.current && active?.catalog ? schemaGroups(active.catalog) : [];
+      return el.current && el.conn.catalog ? schemaGroups(el.conn.catalog) : [];
     }
     if (el.t === 'grp') return el.children;
     if (el.t === 'table') {
@@ -194,19 +203,34 @@ const treeProvider: vscode.TreeDataProvider<TreeNode> = {
       case 'conn':
         return connTreeItem(n.meta);
       case 'db': {
+        const meta = n.conn.session.meta;
         const item = new vscode.TreeItem(
           n.name || '(default database)',
           n.current ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None
         );
+        // The attached database wears the connection's environment color (a plain
+        // green cylinder when it has none); databases with their own open session
+        // are marked too, so a glance tells you where the queries are going.
+        const openHere = !n.current && [...conns.values()].some(
+          (c) => c.session.meta.id === meta.id && (c.currentDb ?? c.session.meta.database) === n.name
+        );
         item.iconPath = n.current
-          ? new vscode.ThemeIcon('database', new vscode.ThemeColor('charts.green'))
-          : new vscode.ThemeIcon('database');
-        item.description = n.current ? 'current' : undefined;
+          ? safeColor(meta.color)
+            ? await connectionIcon(ctx, meta.color, 'db')
+            : new vscode.ThemeIcon('database', new vscode.ThemeColor('charts.green'))
+          : openHere
+            ? new vscode.ThemeIcon('database', new vscode.ThemeColor('charts.blue'))
+            : new vscode.ThemeIcon('database');
+        item.description = n.current ? '✓ current' : openHere ? 'open' : undefined;
         item.contextValue = n.current ? 'databaseCurrent' : 'database';
+        // Only host/user connections can re-attach; a connection string is fixed.
+        const switchable = !n.current && meta.mode === 'fields';
         item.tooltip = n.current
-          ? `${n.name} — connected database`
-          : `${n.name} — click to switch to this database`;
-        if (!n.current) {
+          ? `${n.name} — connected database on "${meta.name}"`
+          : switchable
+            ? `${n.name} — click to switch to this database`
+            : `${n.name} — on "${meta.name}"; switching needs a host/user connection`;
+        if (switchable) {
           item.command = { command: 'dbtool.switchDatabase', title: 'Switch Database', arguments: [n] };
         }
         return item;
@@ -266,12 +290,15 @@ function schemaGroups(cat: Catalog): TreeNode[] {
 
 async function connTreeItem(c: ConnectionMeta): Promise<vscode.TreeItem> {
   const isActive = active?.session.meta.id === c.id;
-  const isOpen = [...conns.values()].some((cn) => cn.session.meta.id === c.id);
+  const isOpen = !!connFor(c.id);
   const item = new vscode.TreeItem(
     c.name,
-    isActive && active?.catalog
+    // Open connections expand into their databases; the current one starts open.
+    isActive
       ? vscode.TreeItemCollapsibleState.Expanded
-      : vscode.TreeItemCollapsibleState.None
+      : isOpen
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None
   );
   item.id = c.id;
   item.description = kindLabel(c.kind) + (isActive ? ' • current' : isOpen ? ' • connected' : '');
@@ -413,7 +440,7 @@ function catalogUpdated(conn: Conn): void {
 
 /**
  * Populate the database level of the tree: the database we're attached to plus
- * every other database on the server (fields-mode connections can switch).
+ * every other database on the server (fields-mode connections can switch to them).
  * Best-effort — missing permissions leave just the current database.
  */
 async function loadDatabases(conn: Conn): Promise<void> {
@@ -425,16 +452,15 @@ async function loadDatabases(conn: Conn): Promise<void> {
     conn.currentDb = session.meta.database;
   }
   if (conns.get(conn.key) !== conn) return; // disconnected while loading
+  // Every server database is listed (a connection string can only *show* them —
+  // re-attaching still needs host/user fields), so the tree is the whole picture.
   try {
-    if (session.meta.mode === 'fields') {
-      const res = await session.run(listDatabasesSql(session.meta.kind));
-      conn.databases = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
-    } else {
-      conn.databases = conn.currentDb ? [conn.currentDb] : [];
-    }
+    const res = await session.run(listDatabasesSql(session.meta.kind));
+    conn.databases = (res.sets.find((s) => s.rows.length)?.rows ?? []).map((r) => String(r[0]));
   } catch {
-    conn.databases = conn.currentDb ? [conn.currentDb] : [];
+    conn.databases = [];
   }
+  if (!conn.databases.length) conn.databases = conn.currentDb ? [conn.currentDb] : [];
   log(`Databases on ${session.meta.name}: ${conn.databases.length || 1} (current: ${conn.currentDb ?? '?'})`);
   refreshUi();
 }
@@ -1046,7 +1072,10 @@ async function createDatabase(): Promise<void> {
 
 /** Attach the explorer to another database of the current fields-mode connection. */
 async function switchDatabase(n?: TreeNode): Promise<void> {
-  const conn = await ensureActive();
+  // Clicked straight on a database node — switch on that node's connection,
+  // which is not necessarily the explorer's current one.
+  const node = n && typeof n === 'object' && 't' in n && n.t === 'db' ? n : undefined;
+  const conn = node?.conn ?? (await ensureActive());
   const session = conn?.session;
   if (!conn || !session) return;
   if (session.meta.mode === 'string') {
@@ -1056,8 +1085,8 @@ async function switchDatabase(n?: TreeNode): Promise<void> {
     return;
   }
   const attached = conn.currentDb ?? session.meta.database;
-  // Clicked straight on a database node in the tree — no picker needed.
-  let target = n && typeof n === 'object' && 't' in n && n.t === 'db' ? n.name : undefined;
+  // A tree node already names the target — no picker needed.
+  let target = node?.name;
   if (!target) {
     let names: string[];
     try {

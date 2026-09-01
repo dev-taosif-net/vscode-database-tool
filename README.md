@@ -13,7 +13,7 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 
 - **Connect to PostgreSQL and SQL Server** — via host/port/user/password *or* a full connection string.
 - **Connection editor tab** — Add/Edit Connection opens a proper form in an editor tab (not quick-input popups), with a **Test Connection** button. Mandatory fields (Name, Host, Port — or the connection string) are marked with a red `*` and highlighted in red if left empty on Save/Test.
-- **Environment colors** — give each connection a color (red = production, green = dev, …). The color appears on the connection's tree icon, the results/editor **tab icon**, the **status bar**, and as a banner in the results panel. (VS Code doesn't let extensions recolor the tab itself.)
+- **Environment colors** — give each connection a color (red = production, green = dev, …). The color appears on the connection's tree icon, the results/editor **tab icon**, the **status bar**, the **connection bar and footer** of every SQL script, and as a banner in the results panel. (VS Code doesn't let extensions recolor the tab itself.)
 - **Per-connection timeout** — configurable connect timeout in seconds (default 10).
 - **Secure storage** — passwords and connection strings go into VS Code SecretStorage (your OS keychain: libsecret / macOS Keychain / Windows Credential Manager). Only non-secret metadata (host, port, names) is kept in extension state. Secrets are never sent into the form webview.
 - **SQL editing with IntelliSense** — ~250 curated built-in functions, each with its **signature, parameters, return type, and a one-line explanation** (`count(expression) → bigint`), plus SQL keywords. Stored procedures/functions show their parameter list and return type too. Suggestions adapt to the dialect of the active connection.
@@ -25,19 +25,21 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 - **Schema browser** — the connected server expands in the sidebar: tables → columns (with exact types, nullability, defaults, identity), views, stored procedures and functions (with parameters). Right-click a table for its first 100 rows; right-click a procedure to view its definition or generate an EXEC/CALL template.
 - **Object management** — `DB Lite: Create New Object` opens review-ready CREATE scripts (table, view, stored procedure, function, index, schema — correct syntax per engine) and can create a **database** after a confirmation. Right-click a table to **Script as SELECT / INSERT / UPDATE / DELETE / CREATE** (INSERT skips identity columns, UPDATE/DELETE are keyed on the primary key, CREATE is reconstructed from real metadata incl. PKs and FKs; views script their live server definition), or to **Count Rows**.
 - **Destructive operations, guarded** — **Drop Table/View**, **Truncate Table**, **Delete All Rows**, and **Drop Procedure/Function** live in a separate danger section of the context menu. Each one shows the affected row count where relevant, requires a modal confirmation **plus typing the exact object name**, always runs a single fully schema-qualified, fully quoted statement (never CASCADE), is logged, and refreshes the schema afterwards.
-- **Switch database** — `DB Lite: Switch Database` lists the server's databases and reconnects the current (host/user) connection against the one you pick; the status bar shows the active database.
+- **All databases in the tree** — every open connection expands into **all** databases on its server; the attached one is marked `✓ current` and wears the connection's environment-color icon (green when it has none), and any other database you also have a session on is flagged too. `DB Lite: Switch Database`, or a click on a database, reconnects a host/user connection against it.
 - **Stored-procedure tooling** — typing `EXEC ` / `CALL ` completes procedure names into ready-to-fill templates with named parameters; procedures and functions also appear in normal completion, the object search, and the schema tree.
 - **Fast object search** — `Ctrl+Alt+T` fuzzy-searches every table, view, procedure and function; pick a table to preview its rows, a routine to open its source.
 - **Semantic SQL coloring** — known tables, columns, aliases, schemas, and functions/procedures are colored by your theme via semantic tokens (toggle: `dbtool.semanticHighlighting`).
 - **Statement snippets** — typing `select` offers `SELECT * FROM ` (uppercase, cursor placed after FROM), plus INSERT/UPDATE/DELETE/COUNT starters.
 - **Auto-UPPERCASE keywords** — type `select ` and it becomes `SELECT ` (toggle: `dbtool.autoUppercaseKeywords`).
 - **Auto table aliases** — after `FROM order_details ` DB Lite suggests `od` (toggle: `dbtool.autoAlias`).
+- **Aliases in scope, first in the list** — the aliases declared in the statement you are writing are offered everywhere inside it (`WHERE `, `ON `, `AND `, the SELECT list, `GROUP BY` / `ORDER BY`, after a comma or an operator) and sorted **above every other suggestion**; each one documents the table it stands for and its columns spelled `alias.column`.
 - **Run queries** — `Ctrl+Enter` (or `Cmd+Enter`) runs the selection (multi-cursor selections run in order), or the whole file if nothing is selected. Multiple statements and multiple result sets are supported; T-SQL `GO` batch separators work.
 - **Results panel** — row counts, execution time, sticky headers, NULL styling, error details.
 - **Grid aggregates** — click/drag cells in the results grid (headers select a column, row numbers a row; Ctrl/Cmd-click toggles, Shift-click extends) and a footer shows **Count · Distinct · Sum · Avg · Min · Max** over the selection. `Ctrl+C` copies selected cells as TSV; `Escape` clears.
 - **Debug logging** — `DB Lite: Show Logs` opens an output channel with connection, query, and schema-load timings and failures.
 - **Panel theme** — `dbtool.theme`: follow VS Code (`default`), or force `dark`/`light` for DB Lite panels.
 - **Connections view** — a DB Lite icon in the activity bar lists saved connections; click to connect, right-click to edit/remove.
+- **Connection bar and footer** — every SQL script is topped with a clickable bar naming the connection its queries run on, and closed with a matching **footer** at the end of the script; both are filled with the connection's environment color, so the tab you are typing in is never in doubt (toggle: `dbtool.connectionFooter`).
 - **Clear all data** — `DB Lite: Clear All Data` command wipes every connection and stored credential (with confirmation).
 - **SSL/encryption options** — Postgres `disable`/`verify`/`no-verify`, SQL Server encrypt + trust-server-certificate for local dev or Azure.
 
@@ -51,6 +53,7 @@ A minimal database client for **PostgreSQL** and **Microsoft SQL Server**. Write
 | `dbtool.schemaCompletion` | `true` | Load schema metadata after connect for context-aware completion |
 | `dbtool.smartJoins` | `true` | Generate JOIN/ON clauses from foreign keys |
 | `dbtool.semanticHighlighting` | `true` | Theme-color known tables/columns/aliases/functions in SQL |
+| `dbtool.connectionFooter` | `true` | Show the connection footer bar at the end of SQL scripts |
 | `dbtool.maxRenderRows` | `1000` | Rows rendered per result set |
 
 ## Getting started

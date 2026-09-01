@@ -44,3 +44,16 @@ export function paletteCss(): string {
 export function safeColor(color: string | undefined): string | undefined {
   return color && /^#[0-9a-fA-F]{3,8}$/.test(color) ? color : undefined;
 }
+
+/**
+ * Readable text color (black/white) for text drawn on a validated hex color —
+ * used by the query footer so light environment colors stay legible.
+ */
+export function contrastFg(color: string): string {
+  const h = color.slice(1);
+  const hex = h.length < 6 ? h.slice(0, 3).split('').map((c) => c + c).join('') : h.slice(0, 6);
+  const n = parseInt(hex, 16);
+  if (!Number.isFinite(n)) return '#ffffff';
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.62 ? '#000000' : '#ffffff';
+}

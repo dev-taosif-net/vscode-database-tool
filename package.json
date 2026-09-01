@@ -2,7 +2,7 @@
   "name": "db-lite",
   "displayName": "DB Lite",
   "description": "Super fast, lightweight SQL client for PostgreSQL and Microsoft SQL Server. Write SQL with built-in function suggestions, execute, and view results instantly. Connections stored securely in the OS keychain.",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "taosif",
   "license": "MIT",
   "author": "Taosif",
@@ -461,7 +461,12 @@
           "default": "default",
           "description": "Color theme for DB Lite panels (query results and the connection editor)."
         },
-        "dbtool.autoUppercaseKeywords": {
+        "dbtool.connectionFooter": {
+      "type": "boolean",
+      "default": true,
+      "description": "Show a footer bar at the end of every SQL script with the tab's connection (name, user, database), filled with that connection's environment color."
+    },
+    "dbtool.autoUppercaseKeywords": {
           "type": "boolean",
           "default": true,
           "description": "Automatically UPPERCASE SQL keywords as you type (select → SELECT)."

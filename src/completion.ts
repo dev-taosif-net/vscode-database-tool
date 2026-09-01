@@ -17,6 +17,9 @@ import {
  *  4. JOIN auto-generation from foreign keys: after `JOIN ` a complete
  *     `table alias ON alias.fk = other.pk` clause; after `JOIN t x ` or
  *     `... ON ` the matching FK condition.
+ *  5. The aliases already declared in the statement being typed, offered
+ *     anywhere in its scope (WHERE / ON / SELECT list / ORDER BY …) and ranked
+ *     above every other item.
  * Items are prebuilt right after the catalog loads (see prewarm), so the
  * per-keystroke path is regexes + map lookups only — no allocation storms.
  */
@@ -37,6 +40,9 @@ const EXEC_TAIL = /\b(exec(?:ute)?|call)\s+[\w$.[\]"]*$/i;
 const USE_TAIL = /\buse\s+[\w$[\]"]*$/i;
 /** Only the statement's first word typed so far → statement snippets apply. */
 const STMT_START = /^\s*[A-Za-z_]*$/;
+/** Spots where a column/alias reference belongs: after a clause keyword, comma or operator. */
+const REF_CONTEXT_TAIL =
+  /(?:\b(?:select|where|and|or|on|by|having|set|when|then|else|case|in|like|between|not|exists|distinct|using|top)\s+|[,(=<>+\-*/%|&]\s*)$/i;
 
 export interface DatabaseInfo {
   /** every database on the server (may be just the current one) */
@@ -182,17 +188,22 @@ export function registerCompletions(
         return execItems(cat);
       }
 
-      const refs = cat ? parseRefs(stmt.full, cat) : [];
+      const refs: TableRef[] = cat ? parseRefs(stmt.full, cat) : parseTableRefs(stmt.full);
       const ctxResult = cat
         ? contextItems(stmt.before, refs, cat, tableItems, tableItemsAliased, schemaItems)
         : { exclusive: false, items: [] as vscode.CompletionItem[] };
       if (ctxResult.exclusive) return ctxResult.items;
 
       const aliasItems = aliasSuggestions(document, position);
+      // An alias is being named right after a table — that spot belongs to
+      // aliasSuggestions, so the statement's existing aliases stay out of it.
+      const naming = TABLE_REF.test(document.lineAt(position.line).text.slice(0, position.character));
+      const scopeAliases = naming ? [] : scopeAliasItems(refs);
 
       // Bare space: only high-signal contextual suggestions, never keyword spam.
       if (byTrigger && context.triggerCharacter === ' ') {
-        return [...ctxResult.items, ...aliasItems];
+        const here = REF_CONTEXT_TAIL.test(stmt.before) ? scopeAliases : [];
+        return [...ctxResult.items, ...aliasItems, ...here];
       }
 
       const kind = activeKind();
@@ -210,7 +221,7 @@ export function registerCompletions(
 
       const items: vscode.CompletionItem[] = [];
       if (STMT_START.test(stmt.before)) items.push(...snippets);
-      items.push(...ctxResult.items, ...aliasItems);
+      items.push(...ctxResult.items, ...aliasItems, ...scopeAliases);
       if (cat) {
         const seen = new Set<CatalogTable>();
         for (const ref of refs) {
@@ -540,6 +551,42 @@ function aliasSuggestions(
     item.preselect = i === 0;
     return item;
   });
+}
+
+/**
+ * Every alias declared in the statement being typed (`FROM orders o JOIN customers c`),
+ * offered anywhere inside it — WHERE, ON, the SELECT list, GROUP/ORDER BY — and sorted
+ * ahead of everything else, since an identifier typed there is nearly always one of them.
+ */
+function scopeAliasItems(refs: TableRef[]): vscode.CompletionItem[] {
+  const out: vscode.CompletionItem[] = [];
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    const alias = ref.alias;
+    if (!alias || seen.has(alias.toLowerCase())) continue;
+    seen.add(alias.toLowerCase());
+    const t = ref.table;
+    const item = new vscode.CompletionItem(
+      { label: alias, description: `alias · ${ref.text}` },
+      vscode.CompletionItemKind.Variable
+    );
+    item.detail = t ? `alias for ${t.schema}.${t.name} — ${t.columns.length} columns` : `alias for ${ref.text}`;
+    if (t) {
+      // Columns spelled with the alias, so the popup doubles as a cheat sheet.
+      const md = new vscode.MarkdownString();
+      md.appendCodeblock(`${t.schema}.${t.name} ${alias}`, 'sql');
+      const shown = t.columns.slice(0, 20);
+      for (const c of shown) md.appendMarkdown(`- \`${alias}.${c.name}\` — ${c.dataType}\n`);
+      if (t.columns.length > shown.length) {
+        md.appendMarkdown(`- … ${t.columns.length - shown.length} more columns\n`);
+      }
+      item.documentation = md;
+    }
+    // '!' sorts before every other group, so in-scope aliases head the list.
+    item.sortText = '!' + String(out.length).padStart(2, '0');
+    out.push(item);
+  }
+  return out;
 }
 
 /** orders → o · order_details → od · OrderDetails → od · customers → c, cus */
